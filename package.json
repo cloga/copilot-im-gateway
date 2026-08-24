@@ -5,24 +5,29 @@
   "description": "Secure local-first IM gateway for GitHub Copilot",
   "type": "module",
   "engines": {
-    "node": "^22.12.0 || >=24.0.0"
+    "node": "^22.13.0 || >=24.0.0"
   },
   "scripts": {
-    "bootstrap": "npm ci --ignore-scripts",
+    "audit:check": "npm audit --audit-level=high",
+    "bootstrap": "npm ci --ignore-scripts --no-audit --no-fund",
     "build": "tsc -p tsconfig.build.json",
-    "check": "npm run lint && npm run typecheck && npm test && npm run build && npm run release:verify",
+    "check": "npm run verify",
+    "coverage:check": "node scripts/coverage-check.mjs",
     "daemon": "node dist/daemon/main.js",
     "dev": "tsx src/daemon/main.ts",
     "extension:install": "node scripts/install-user-extension.mjs",
     "lint": "eslint .",
+    "policy:check": "node scripts/policy-check.mjs",
     "release:package": "node scripts/package-release.mjs",
     "release:installer": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/installer/build-windows-installer.ps1",
     "release:installer:smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/installer/smoke-windows-installer.ps1",
     "release:validate": "node scripts/validate-release.mjs",
     "release:verify": "node scripts/verify-release.mjs",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run lint && npm run typecheck && npm run test:coverage && npm run coverage:check && npm run build && npm run audit:check && npm run policy:check && npm run release:verify"
   },
   "dependencies": {
     "zod": "4.4.3"
@@ -31,11 +36,13 @@
     "@eslint/js": "9.39.1",
     "@github/copilot-sdk": "1.0.11",
     "@types/node": "24.10.1",
+    "@vitest/coverage-v8": "4.1.10",
     "eslint": "9.39.1",
     "globals": "16.5.0",
     "tsx": "4.23.12",
     "typescript": "5.9.3",
     "typescript-eslint": "8.50.0",
-    "vitest": "4.1.10"
+    "vitest": "4.1.10",
+    "yaml": "2.9.0"
   }
 }

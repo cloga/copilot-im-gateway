@@ -1,0 +1,160 @@
+{
+  "version": 1,
+  "defaultBranch": "main",
+  "repositoryFullName": "cloga/copilot-im-gateway",
+  "branchAccount": "cloga",
+  "branchAccountPrefix": "cloga/",
+  "automationAccount": "dependabot[bot]",
+  "automationBranchPrefixes": [
+    "dependabot/"
+  ],
+  "qualityGate": "npm run verify",
+  "coverageBaseline": ".github/coverage-baseline.json",
+  "allowedPaths": [
+    ".github/**",
+    ".env.example",
+    ".gitignore",
+    "AGENTS.md",
+    "LICENSE",
+    "README.md",
+    "THIRD_PARTY_NOTICES.md",
+    "docs/**",
+    "eslint.config.mjs",
+    "package-lock.json",
+    "package.json",
+    "scripts/**",
+    "src/**",
+    "tests/**",
+    "tsconfig.build.json",
+    "tsconfig.json",
+    "vitest.config.ts"
+  ],
+  "deniedPaths": [
+    "**/.env",
+    "**/.env.*",
+    "**/.copilot-im-gateway/**",
+    "**/*.db",
+    "**/*.sqlite",
+    "**/*.sqlite3",
+    "**/*.tgz",
+    "**/*.zip",
+    "**/*.exe",
+    "**/*.sha256",
+    "**/coverage/**",
+    "**/dist/**",
+    "**/gateway-state.json",
+    "**/node_modules/**",
+    "release/**"
+  ],
+  "protectedPaths": [
+    ".github/CODEOWNERS",
+    ".github/agent-policy.json",
+    ".github/coverage-baseline.json",
+    ".github/extensions/im-gateway/**",
+    ".github/workflows/**",
+    "eslint.config.mjs",
+    "package-lock.json",
+    "package.json",
+    "scripts/coverage-check.mjs",
+    "scripts/governance-check.mjs",
+    "scripts/installer/**",
+    "scripts/package-release.mjs",
+    "scripts/path-policy.mjs",
+    "scripts/policy-check.mjs",
+    "scripts/release/**",
+    "scripts/validate-release.mjs",
+    "scripts/verify-release.mjs",
+    "scripts/workflow-policy.mjs",
+    "scripts/install-user-extension.mjs",
+    "src/channels/weixin/**",
+    "src/core/contracts.ts",
+    "src/core/security.ts",
+    "src/core/serial-queue.ts",
+    "src/daemon/auth.ts",
+    "src/daemon/gateway.ts",
+    "src/daemon/http-server.ts",
+    "src/daemon/main.ts",
+    "src/daemon/schemas.ts",
+    "src/daemon/store.ts",
+    "tests/extension.test.ts",
+    "tests/governance.test.ts",
+    "tests/http.integration.test.ts",
+    "tests/release-package.test.ts",
+    "tests/security.test.ts",
+    "tests/serial-queue.test.ts",
+    "tests/store.test.ts",
+    "tests/weixin.test.ts",
+    "tsconfig.build.json",
+    "tsconfig.json",
+    "vitest.config.ts"
+  ],
+  "runtimeSecurityPaths": [
+    ".github/extensions/im-gateway/**",
+    "src/**"
+  ],
+  "regressionTestPaths": [
+    "tests/**/*.test.ts"
+  ],
+  "productCodePaths": [
+    ".github/extensions/im-gateway/**",
+    "src/**"
+  ],
+  "forbiddenProductPatterns": [
+    "--acp",
+    "approveAll",
+    "api.githubcopilot.com",
+    "child_process",
+    "0.0.0.0",
+    "\"::\""
+  ],
+  "forbiddenTestPatterns": [
+    "ilinkai.weixin.qq.com"
+  ],
+  "architectureAssertions": [
+    {
+      "path": ".github/extensions/im-gateway/extension.mjs",
+      "mustContain": [
+        "joinSession"
+      ],
+      "mustNotContain": [
+        "--acp",
+        "approveAll",
+        "child_process"
+      ]
+    },
+    {
+      "path": "src/daemon/http-server.ts",
+      "mustContain": [
+        "127.0.0.1"
+      ],
+      "mustNotContain": [
+        "0.0.0.0",
+        "\"::\""
+      ]
+    },
+    {
+      "path": ".github/extensions/im-gateway/canvas.mjs",
+      "mustContain": [
+        "127.0.0.1"
+      ],
+      "mustNotContain": [
+        "0.0.0.0",
+        "\"::\""
+      ]
+    },
+    {
+      "path": "vitest.config.ts",
+      "mustContain": [
+        "\"src/**/*.ts\"",
+        "\".github/extensions/im-gateway/**/*.mjs\"",
+        "exclude: [\".github/extensions/im-gateway/extension.mjs\"]",
+        "provider: \"v8\"",
+        "reporter: [\"text\", \"json-summary\"]"
+      ],
+      "mustNotContain": [
+        "enabled: false",
+        "all: false"
+      ]
+    }
+  ]
+}

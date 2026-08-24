@@ -16,6 +16,12 @@ The daemon owns all durable and long-lived state. The extension is deliberately
 ephemeral because Copilot reloads extensions on `/clear` and foreground-session
 replacement.
 
+This is the complete product architecture, not an interchangeable backend
+slot. The extension must continue to use the official SDK `joinSession()` API
+and must not be replaced by an external CLI wrapper. Generic ACP processes,
+`copilot --acp`, arbitrary agent commands, and reverse-engineered Copilot
+authentication/model APIs are explicitly outside the architecture.
+
 ## Routing
 
 An inbound route key is `channelId:conversationId`. It maps to a durable binding
@@ -67,3 +73,14 @@ The project extension is discovered from
 foreground session, polls the daemon while alive, and stops on session shutdown
 or process termination. No credential or conversation state is kept only in the
 extension process.
+
+## Governance invariants
+
+Repository policy protects the extension, loopback listeners, security tests,
+coverage floor, release scripts, installer verification, and workflow closure.
+Coverage includes the Canvas, gateway client, and side-effect-free extension
+runtime. Only the thin `joinSession()` bootstrap entrypoint is excluded because
+importing it joins the live foreground session.
+Default automated tests use deterministic transports and loopback HTTP; live
+iLink/network behavior remains a manual smoke test. See
+[change-impact.md](change-impact.md) for required regression evidence.

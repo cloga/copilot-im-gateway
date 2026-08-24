@@ -42,3 +42,6 @@ isolation in this initial personal/local scope.
 - Automatic approval of remote side effects
 - Routing Microsoft work data through personal messaging accounts
 - Reverse-engineered Copilot APIs or authentication
+- Generic ACP/`copilot --acp` backends or arbitrary agent commands
+- Replacing the official `joinSession()` extension with an external CLI wrapper
+- Live iLink or other external-network access in default automated tests

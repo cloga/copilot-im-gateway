@@ -99,28 +99,38 @@ See [docs/development.md](docs/development.md) for setup and verification,
 | `npm run lint` | Lint source, tests, scripts, and extension code |
 | `npm run typecheck` | Type-check without emitting |
 | `npm test` | Run deterministic unit/integration tests |
+| `npm run test:coverage` | Run deterministic tests with all production source measured |
+| `npm run coverage:check` | Enforce the protected coverage floor |
+| `npm run audit:check` | Audit dependencies explicitly |
+| `npm run policy:check` | Enforce diff-aware local repository policy |
 | `npm run build` | Compile production JavaScript |
 | `npm run release:package` | Build the `.tgz` and Windows `.zip` archives and checksums |
 | `npm run release:installer` | Build the self-contained Windows x64 Setup EXE and checksum |
 | `npm run release:installer:smoke` | Silently install, probe, and uninstall the Windows Setup EXE |
 | `npm run release:validate` | Validate release contents and checksums |
 | `npm run release:verify` | Verify contents and deterministic packaging |
-| `npm run check` | Run lint, typecheck, tests, build, and release verification |
+| `npm run verify` | Run the canonical lint, type, coverage, build, audit, policy, and release gate |
+| `npm run check` | Compatibility alias for `npm run verify` |
 
 ## Maintainer release
 
 1. Update `version` in `package.json` and `package-lock.json`.
-2. Open and merge a pull request after `npm run check` passes.
+2. Open and merge a pull request after `npm run verify` passes.
 3. Tag the merged commit with the matching semantic version, for example
    `v0.2.0`, and push the tag.
 4. The `Release` workflow checks the tag against `package.json`, runs the full
-   check, builds once in CI, publishes both archives, the Windows Setup EXE,
+   canonical verify gate, builds once in CI, publishes both archives, the Windows Setup EXE,
    and all checksums, and generates GitHub Release notes.
 
 Do not create a tag for an unmerged commit. GitHub Releases are the distribution
 channel; no npm publishing credentials are required. Live WeChat QR login and
 message delivery cannot be automated safely and remain a
 [manual smoke test](docs/manual-smoke-test.md).
+
+After governance bootstrap, maintainers must protect `v*` tags with a repository
+ruleset or require a protected release environment. The Release workflow also
+fetches `origin/main` and rejects any tag commit that is not on its ancestry
+before running npm or packaging scripts.
 
 ## Prior art
 

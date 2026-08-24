@@ -39,13 +39,26 @@ describe("release packaging", () => {
     );
     const firstStage = path.join(root, "first");
     const secondStage = path.join(root, "second");
+    const incompleteStage = path.join(root, "incomplete");
     const firstArchive = path.join(root, "first.zip");
     const secondArchive = path.join(root, "second.zip");
+    const incompleteArchive = path.join(root, "incomplete.zip");
     try {
       for (const entry of requiredEntries) {
         const relativePath = entry.replace(/^package\//u, "");
         for (const stage of [firstStage, secondStage]) {
           const destination = path.join(stage, ...relativePath.split("/"));
+          await mkdir(path.dirname(destination), { recursive: true });
+          await writeFile(destination, `fixture:${relativePath}\n`, "utf8");
+        }
+        if (
+          entry !==
+          "package/.github/extensions/im-gateway/extension-runtime.mjs"
+        ) {
+          const destination = path.join(
+            incompleteStage,
+            ...relativePath.split("/"),
+          );
           await mkdir(path.dirname(destination), { recursive: true });
           await writeFile(destination, `fixture:${relativePath}\n`, "utf8");
         }
@@ -64,6 +77,15 @@ describe("release packaging", () => {
           .update(await readFile(firstArchive))
           .digest("hex"),
       ).toBe(firstChecksum.digest);
+
+      await createDeterministicZip(incompleteStage, incompleteArchive);
+      const incompleteChecksum = await writeChecksum(incompleteArchive);
+      await expect(
+        validateReleaseArchive(
+          incompleteArchive,
+          incompleteChecksum.checksumPath,
+        ),
+      ).rejects.toThrow("extension-runtime.mjs");
 
       await writeFile(firstChecksum.checksumPath, "invalid  first.zip\n", "utf8");
       await expect(
@@ -88,6 +110,10 @@ describe("release packaging", () => {
       path.join(root, ".github", "workflows", "release.yml"),
       "utf8",
     );
+    const installScript = await readFile(
+      path.join(root, "scripts", "release", "install.ps1"),
+      "utf8",
+    );
 
     expect(buildScript).toContain('$nodeVersion = "24.11.1"');
     expect(buildScript).toContain(
@@ -100,5 +126,12 @@ describe("release packaging", () => {
     expect(installer).not.toContain("runascurrentuser");
     expect(releaseWorkflow).toContain("npm run release:installer:smoke");
     expect(releaseWorkflow).toContain("release/*.exe");
+    expect(installScript).toContain(
+      "$nodeVersion.Major -eq 22 -and $nodeVersion.Minor -ge 13",
+    );
+    expect(installScript).toContain(
+      "Node.js 22.13+ (excluding 23.x) or 24+ is required",
+    );
+    expect(installScript).not.toContain("22.12");
   });
 });

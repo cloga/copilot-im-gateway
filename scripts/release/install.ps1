@@ -15,11 +15,11 @@ Assert-Command "npm"
 $nodeVersionText = (& node --version).Trim().TrimStart("v")
 $nodeVersion = [Version]$nodeVersionText
 $supportedNode = (
-    ($nodeVersion.Major -eq 22 -and $nodeVersion.Minor -ge 12) -or
+    ($nodeVersion.Major -eq 22 -and $nodeVersion.Minor -ge 13) -or
     $nodeVersion.Major -ge 24
 )
 if (-not $supportedNode) {
-    throw "Node.js 22.12+ (excluding 23.x) or 24+ is required; found $nodeVersionText."
+    throw "Node.js 22.13+ (excluding 23.x) or 24+ is required; found $nodeVersionText."
 }
 
 $copilotRoot = Join-Path $HOME ".copilot"

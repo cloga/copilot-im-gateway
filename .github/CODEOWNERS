@@ -1,0 +1,21 @@
+* @cloga
+
+/.github/ @cloga
+/.github/extensions/im-gateway/ @cloga
+/scripts/governance-check.mjs @cloga
+/scripts/path-policy.mjs @cloga
+/scripts/policy-check.mjs @cloga
+/scripts/coverage-check.mjs @cloga
+/scripts/workflow-policy.mjs @cloga
+/scripts/install-user-extension.mjs @cloga
+/scripts/installer/ @cloga
+/scripts/release/ @cloga
+/src/channels/weixin/ @cloga
+/src/core/security.ts @cloga
+/src/daemon/auth.ts @cloga
+/src/daemon/http-server.ts @cloga
+/src/daemon/store.ts @cloga
+/tests/extension.test.ts @cloga
+/tests/security.test.ts @cloga
+/tests/store.test.ts @cloga
+/tests/weixin.test.ts @cloga
