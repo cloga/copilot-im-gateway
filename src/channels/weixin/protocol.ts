@@ -95,7 +95,9 @@ export interface WeixinUpdates {
 }
 
 export interface WeixinProtocolClient {
-  getLoginQr(localTokens: string[]): Promise<{ id: string; url: string }>;
+  getLoginQr(
+    localTokens: string[],
+  ): Promise<{ id: string; url: string; pollingBaseUrl: string }>;
   pollLoginStatus(input: {
     baseUrl: string;
     qrCode: string;
@@ -141,7 +143,7 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
 
   async getLoginQr(
     localTokens: string[],
-  ): Promise<{ id: string; url: string }> {
+  ): Promise<{ id: string; url: string; pollingBaseUrl: string }> {
     const response = await this.#request(
       this.#loginBaseUrl,
       "/ilink/bot/get_bot_qrcode?bot_type=3",
@@ -152,7 +154,11 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
       },
     );
     const parsed = qrCodeResponseSchema.parse(response);
-    return { id: parsed.qrcode, url: parsed.qrcode_img_content };
+    return {
+      id: parsed.qrcode,
+      url: parsed.qrcode_img_content,
+      pollingBaseUrl: this.#loginBaseUrl,
+    };
   }
 
   async pollLoginStatus(input: {

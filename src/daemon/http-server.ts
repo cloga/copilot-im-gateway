@@ -409,7 +409,7 @@ async function handleRequest(
               },
             })
           : new GatewayError({
-              code: gatewayErrorCodes.conflict,
+              code: gatewayErrorCodes.internal,
               message: "The gateway could not complete the request.",
               status: 500,
               retryable: true,

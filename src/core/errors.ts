@@ -6,6 +6,7 @@ export const gatewayErrorCodes = {
   authenticationRequired: "AUTHENTICATION_REQUIRED",
   channelNotFound: "CHANNEL_NOT_FOUND",
   conflict: "STATE_CONFLICT",
+  internal: "INTERNAL_ERROR",
   invalidInput: "INVALID_INPUT",
   messageDuplicate: "MESSAGE_DUPLICATE",
   messageNotFound: "MESSAGE_NOT_FOUND",

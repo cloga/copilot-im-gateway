@@ -82,13 +82,24 @@ function renderHtml() {
       if (!response.ok) throw new Error(payload.error || "Request failed");
       return payload;
     }
+    function esc(value) {
+      return String(value).replace(/[&<>"']/g, character => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      })[character]);
+    }
+    function safeImageUrl(value) {
+      try {
+        const parsed = new URL(value);
+        return parsed.protocol === "https:" || parsed.protocol === "data:" ? esc(parsed.href) : "";
+      } catch { return ""; }
+    }
     function values(form) { return Object.fromEntries(new FormData(form).entries()); }
     async function refresh() {
       notice.textContent = "";
       try {
         const [status, audit] = await Promise.all([api("/api/status"), api("/api/audit")]);
         document.querySelector("#channels").innerHTML = status.channels.map(channel =>
-          '<div><span class="badge">' + channel.id + '</span><p>' + channel.health.state + '</p></div>'
+          '<div><span class="badge">' + esc(channel.id) + '</span><p>' + esc(channel.health.state) + '</p></div>'
         ).join("");
         document.querySelector("#configuration").textContent = JSON.stringify({
           workspaceAliases: status.workspaceAliases,
@@ -99,10 +110,10 @@ function renderHtml() {
         document.querySelector("#approvals").innerHTML = status.pendingApprovals.length === 0
           ? '<div class="muted">No pending approvals.</div>'
           : status.pendingApprovals.map(approval =>
-              '<div class="approval"><strong>' + approval.scope.kind + '</strong><p>' +
-              approval.scope.summary + '</p><button data-decision="approved" data-id="' +
-              approval.requestId + '">Approve once</button> <button class="secondary" data-decision="denied" data-id="' +
-              approval.requestId + '">Deny</button></div>'
+              '<div class="approval"><strong>' + esc(approval.scope.kind) + '</strong><p>' +
+              esc(approval.scope.summary) + '</p><button data-decision="approved" data-id="' +
+              esc(approval.requestId) + '">Approve once</button> <button class="secondary" data-decision="denied" data-id="' +
+              esc(approval.requestId) + '">Deny</button></div>'
             ).join("");
       } catch (error) { notice.textContent = String(error); }
     }
@@ -113,16 +124,18 @@ function renderHtml() {
     document.querySelector("#refresh").onclick = refresh;
     document.querySelector("#login-start").onclick = async () => {
       const result = await api("/api/login/start", { method: "POST", body: "{}" });
-      document.querySelector("#qr").innerHTML = result.qrCodeUrl
-        ? '<p>' + result.state + '</p><img alt="WeChat login QR" src="' + result.qrCodeUrl + '" />'
-        : '<p>' + result.state + '</p>';
+      const qrUrl = result.qrCodeUrl ? safeImageUrl(result.qrCodeUrl) : "";
+      document.querySelector("#qr").innerHTML = qrUrl
+        ? '<p>' + esc(result.state) + '</p><img alt="WeChat login QR" src="' + qrUrl + '" />'
+        : '<p>' + esc(result.state) + '</p>';
       await refresh();
     };
     document.querySelector("#verify-form").onsubmit = async event => {
       event.preventDefault();
       const result = await api("/api/login/poll", { method: "POST", body: JSON.stringify(values(event.currentTarget)) });
-      document.querySelector("#qr").innerHTML = '<p>' + result.state + '</p>' +
-        (result.qrCodeUrl ? '<img alt="WeChat login QR" src="' + result.qrCodeUrl + '" />' : "");
+      const qrUrl = result.qrCodeUrl ? safeImageUrl(result.qrCodeUrl) : "";
+      document.querySelector("#qr").innerHTML = '<p>' + esc(result.state) + '</p>' +
+        (qrUrl ? '<img alt="WeChat login QR" src="' + qrUrl + '" />' : "");
       await refresh();
     };
     document.querySelector("#alias-form").onsubmit = async event => { event.preventDefault(); await post("/api/aliases", values(event.currentTarget)); };

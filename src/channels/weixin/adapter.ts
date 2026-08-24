@@ -85,7 +85,7 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
     this.#login = {
       qrCode: qr.id,
       qrCodeUrl: qr.url,
-      pollingBaseUrl: "https://ilinkai.weixin.qq.com",
+      pollingBaseUrl: qr.pollingBaseUrl,
       startedAt: this.#clock.now().getTime(),
     };
     await this.#setHealth({
@@ -265,6 +265,9 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
             `Weixin getUpdates error ${updates.errorCode}: ${updates.errorMessage ?? "unknown"}`,
           );
         }
+        for (const message of updates.messages) {
+          await this.#acceptMessage(message);
+        }
         if (updates.cursor !== cursor) {
           cursor = updates.cursor;
           this.#store.setChannelState(
@@ -273,9 +276,6 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
             cursor,
             this.#clock.now().toISOString(),
           );
-        }
-        for (const message of updates.messages) {
-          await this.#acceptMessage(message);
         }
         retryMs = 2_000;
         await sleep(updates.messages.length > 0 ? 100 : 300, signal);

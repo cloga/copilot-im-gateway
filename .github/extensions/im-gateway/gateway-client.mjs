@@ -11,31 +11,30 @@ export function resolveGatewayConnection() {
     process.env.COPILOT_IM_GATEWAY_TOKEN_FILE ??
       path.join(dataDirectory, "auth-token"),
   );
-  const token = readFileSync(tokenPath, "utf8").trim();
-  if (token.length < 32) {
-    throw new Error(`Gateway token file '${tokenPath}' is invalid.`);
-  }
   return {
     baseUrl:
       process.env.COPILOT_IM_GATEWAY_URL ?? "http://127.0.0.1:32147",
-    token,
     tokenPath,
   };
 }
 
 export class GatewayClient {
-  /** @param {{baseUrl: string, token: string}} options */
+  /** @param {{baseUrl: string, tokenPath: string}} options */
   constructor(options) {
     this.baseUrl = options.baseUrl.replace(/\/$/, "");
-    this.token = options.token;
+    this.tokenPath = options.tokenPath;
   }
 
   /** @param {string} pathname @param {RequestInit} [init] */
   async request(pathname, init = {}) {
+    const token = readFileSync(this.tokenPath, "utf8").trim();
+    if (token.length < 32) {
+      throw new Error(`Gateway token file '${this.tokenPath}' is invalid.`);
+    }
     const response = await fetch(`${this.baseUrl}${pathname}`, {
       ...init,
       headers: {
-        Authorization: `Bearer ${this.token}`,
+        Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
         ...init.headers,
       },
