@@ -73,4 +73,32 @@ describe("release packaging", () => {
       await rm(root, { force: true, recursive: true });
     }
   });
+
+  it("pins and wires the self-contained Windows installer", async () => {
+    const root = path.resolve(import.meta.dirname, "..");
+    const buildScript = await readFile(
+      path.join(root, "scripts", "installer", "build-windows-installer.ps1"),
+      "utf8",
+    );
+    const installer = await readFile(
+      path.join(root, "scripts", "installer", "windows-installer.iss"),
+      "utf8",
+    );
+    const releaseWorkflow = await readFile(
+      path.join(root, ".github", "workflows", "release.yml"),
+      "utf8",
+    );
+
+    expect(buildScript).toContain('$nodeVersion = "24.11.1"');
+    expect(buildScript).toContain(
+      '$nodeArchiveSha256 = "5355ae6d7c49eddcfde7d34ac3486820600a831bf81dc3bdca5c8db6a9bb0e76"',
+    );
+    expect(buildScript).toContain("npm-cli.js");
+    expect(installer).toContain("PrivilegesRequired=lowest");
+    expect(installer).toContain("ArchitecturesAllowed=x64compatible");
+    expect(installer).toContain("Copilot-IM-Gateway-Setup-v{#AppVersion}-x64");
+    expect(installer).not.toContain("runascurrentuser");
+    expect(releaseWorkflow).toContain("npm run release:installer:smoke");
+    expect(releaseWorkflow).toContain("release/*.exe");
+  });
 });

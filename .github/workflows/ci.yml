@@ -19,3 +19,20 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run check
+  windows-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.11.1
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      - name: Install pinned Inno Setup
+        shell: pwsh
+        run: |
+          $compiler = & .\scripts\installer\install-inno-setup.ps1
+          "ISCC_PATH=$compiler" >> $env:GITHUB_ENV
+      - run: npm run release:installer
+      - run: npm run release:installer:smoke
