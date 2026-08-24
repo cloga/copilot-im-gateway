@@ -23,16 +23,41 @@ through the official GitHub Copilot SDK extension runtime.
 - An experimental in-app Canvas for login, health, bindings, workspace aliases,
   pending approvals, and audit visibility.
 
-## Quick start
+## Install a release
 
-Prerequisites: Node.js 22.12+ and GitHub Copilot CLI/App 1.0.80+.
+Prerequisites: Windows PowerShell, Node.js 22.12+ (excluding 23.x) or 24+, npm,
+and GitHub Copilot CLI/App 1.0.80+.
 
-```powershell
-npm ci
-npm run build
-npm test
-npm run daemon
-```
+1. Download `copilot-im-gateway-v<VERSION>.tgz` and its `.sha256` file from
+   [GitHub Releases](https://github.com/cloga/copilot-im-gateway/releases).
+2. Verify and extract the archive:
+
+   ```powershell
+   $archive = "copilot-im-gateway-v0.1.0.tgz"
+   $expected = (Get-Content "$archive.sha256").Split()[0]
+   $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+   if ($actual -ne $expected) { throw "Release checksum mismatch" }
+   tar -xzf $archive
+   Set-Location package
+   ```
+
+3. Install production dependencies and the user-scoped Copilot extension:
+
+   ```powershell
+   .\install.ps1
+   ```
+
+4. Reload extensions in GitHub Copilot App, then start the daemon:
+
+   ```powershell
+   & "$HOME\.copilot\im-gateway\start.ps1"
+   ```
+
+The release contains compiled JavaScript, so consumers do not need TypeScript,
+development dependencies, or a local build. The installer runs
+`npm ci --omit=dev --ignore-scripts`, installs under
+`$HOME\.copilot\im-gateway`, and copies only the versioned extension files to
+`$HOME\.copilot\extensions\im-gateway`. It does not read or write credentials.
 
 The first daemon start creates a local bearer token in the data directory with
 owner-only permissions where supported. Inspect the startup message for the
@@ -55,7 +80,25 @@ See [docs/development.md](docs/development.md) for setup and verification,
 | `npm run typecheck` | Type-check without emitting |
 | `npm test` | Run deterministic unit/integration tests |
 | `npm run build` | Compile production JavaScript |
-| `npm run check` | Run lint, typecheck, tests, and build |
+| `npm run release:package` | Build the release archive and SHA-256 checksum |
+| `npm run release:validate` | Validate release contents and checksum |
+| `npm run release:verify` | Verify contents and deterministic packaging |
+| `npm run check` | Run lint, typecheck, tests, build, and release verification |
+
+## Maintainer release
+
+1. Update `version` in `package.json` and `package-lock.json`.
+2. Open and merge a pull request after `npm run check` passes.
+3. Tag the merged commit with the matching semantic version, for example
+   `v0.2.0`, and push the tag.
+4. The `Release` workflow checks the tag against `package.json`, runs the full
+   check, builds once in CI, publishes the archive and checksum, and generates
+   GitHub Release notes.
+
+Do not create a tag for an unmerged commit. GitHub Releases are the distribution
+channel; no npm publishing credentials are required. Live WeChat QR login and
+message delivery cannot be automated safely and remain a
+[manual smoke test](docs/manual-smoke-test.md).
 
 ## Prior art
 
