@@ -14,6 +14,7 @@ export const requiredEntries = [
   "package/.env.example",
   "package/.github/extensions/im-gateway/canvas.mjs",
   "package/.github/extensions/im-gateway/extension.mjs",
+  "package/.github/extensions/im-gateway/extension-runtime.mjs",
   "package/.github/extensions/im-gateway/gateway-client.mjs",
   "package/README.md",
   "package/THIRD_PARTY_NOTICES.md",

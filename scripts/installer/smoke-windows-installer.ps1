@@ -58,9 +58,26 @@ try {
             throw "Installed file is missing: $expectedFile"
         }
     }
-    foreach ($extensionFile in @("extension.mjs", "canvas.mjs", "gateway-client.mjs")) {
+    foreach ($extensionFile in @("extension.mjs", "extension-runtime.mjs", "canvas.mjs", "gateway-client.mjs")) {
         if (-not (Test-Path -LiteralPath (Join-Path $extensionDirectory $extensionFile) -PathType Leaf)) {
             throw "Installed extension file is missing: $extensionFile"
+        }
+    }
+    $pendingImports = [Collections.Generic.Queue[string]]::new()
+    $visitedModules = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $pendingImports.Enqueue((Join-Path $extensionDirectory "extension.mjs"))
+    while ($pendingImports.Count -gt 0) {
+        $modulePath = $pendingImports.Dequeue()
+        if (-not $visitedModules.Add($modulePath)) {
+            continue
+        }
+        $moduleSource = Get-Content -LiteralPath $modulePath -Raw
+        foreach ($match in [regex]::Matches($moduleSource, '(?m)^\s*(?:import|export)\s+(?:[^''"]+\s+from\s+)?[''"](?<specifier>\./[^''"]+)[''"]')) {
+            $dependencyPath = [IO.Path]::GetFullPath((Join-Path (Split-Path $modulePath) $match.Groups["specifier"].Value))
+            if (-not (Test-Path -LiteralPath $dependencyPath -PathType Leaf)) {
+                throw "Installed extension import is missing: $($match.Groups["specifier"].Value)"
+            }
+            $pendingImports.Enqueue($dependencyPath)
         }
     }
 
