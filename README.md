@@ -25,45 +25,47 @@ through the official GitHub Copilot SDK extension runtime.
 
 ## Install a release
 
-Prerequisites: Windows PowerShell, Node.js 22.12+ (excluding 23.x) or 24+, npm,
-and GitHub Copilot CLI/App 1.0.80+.
+GitHub Copilot CLI/App 1.0.80+ is required. The recommended Windows installer
+includes the application runtime and does not require Node.js, npm, or
+TypeScript.
 
 ### Windows
 
-1. Download `copilot-im-gateway-v0.1.1-windows.zip` and
-   `copilot-im-gateway-v0.1.1-windows.zip.sha256` from
+1. Download `Copilot-IM-Gateway-Setup-v0.1.2-x64.exe` and
+   `Copilot-IM-Gateway-Setup-v0.1.2-x64.exe.sha256` from
    [GitHub Releases](https://github.com/cloga/copilot-im-gateway/releases).
-2. Verify and extract the archive:
+2. Verify the installer:
 
    ```powershell
-   $archive = "copilot-im-gateway-v0.1.1-windows.zip"
-   $expected = (Get-Content "$archive.sha256").Split()[0]
-   $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+   $installer = "Copilot-IM-Gateway-Setup-v0.1.2-x64.exe"
+   $expected = (Get-Content "$installer.sha256").Split()[0]
+   $actual = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant()
    if ($actual -ne $expected) { throw "Release checksum mismatch" }
-   Expand-Archive $archive -DestinationPath .
-   Set-Location package
    ```
 
-3. Install production dependencies and the user-scoped Copilot extension:
+3. Run the installer. It installs per-user under
+   `%LOCALAPPDATA%\Programs\Copilot IM Gateway`, registers the extension under
+   `%USERPROFILE%\.copilot\extensions\im-gateway`, and creates Start Menu
+   shortcuts. Reload extensions in GitHub Copilot App after installation.
+4. Open **Start Copilot IM Gateway** from the Start Menu. The installer does not
+   configure persistent auto-start.
+5. Use **Gateway status** to open the unauthenticated local health endpoint.
+   Uninstall from Windows Installed Apps or the Start Menu shortcut.
 
-   ```powershell
-   .\install.ps1
-   ```
+> [!WARNING]
+> The initial Windows Setup EXE is not code-signed. Windows SmartScreen may show
+> an "unrecognized app" warning. Verify the published SHA-256 checksum before
+> choosing **More info** and **Run anyway**. The release does not claim a trusted
+> publisher signature.
 
-4. Reload extensions in GitHub Copilot App, then start the daemon:
-
-   ```powershell
-   & "$HOME\.copilot\im-gateway\start.ps1"
-   ```
-
-The Windows ZIP contains architecture-neutral JavaScript and PowerShell scripts.
-It is not an `.exe` and does not bundle a Node.js runtime; install a supported
-Node.js version separately as listed in the prerequisites.
+The existing Windows ZIP remains available for advanced users. It does not
+bundle Node.js and still requires Windows PowerShell, a supported Node.js
+version, and npm before running `install.ps1`.
 
 ### Cross-platform archive
 
 Cross-platform users can instead download
-`copilot-im-gateway-v0.1.1.tgz` and its `.sha256` file, verify it with their
+`copilot-im-gateway-v0.1.2.tgz` and its `.sha256` file, verify it with their
 platform's SHA-256 tool, and extract it with:
 
 ```sh
@@ -99,6 +101,8 @@ See [docs/development.md](docs/development.md) for setup and verification,
 | `npm test` | Run deterministic unit/integration tests |
 | `npm run build` | Compile production JavaScript |
 | `npm run release:package` | Build the `.tgz` and Windows `.zip` archives and checksums |
+| `npm run release:installer` | Build the self-contained Windows x64 Setup EXE and checksum |
+| `npm run release:installer:smoke` | Silently install, probe, and uninstall the Windows Setup EXE |
 | `npm run release:validate` | Validate release contents and checksums |
 | `npm run release:verify` | Verify contents and deterministic packaging |
 | `npm run check` | Run lint, typecheck, tests, build, and release verification |
@@ -110,8 +114,8 @@ See [docs/development.md](docs/development.md) for setup and verification,
 3. Tag the merged commit with the matching semantic version, for example
    `v0.2.0`, and push the tag.
 4. The `Release` workflow checks the tag against `package.json`, runs the full
-   check, builds once in CI, publishes both archives and checksums, and
-   generates GitHub Release notes.
+   check, builds once in CI, publishes both archives, the Windows Setup EXE,
+   and all checksums, and generates GitHub Release notes.
 
 Do not create a tag for an unmerged commit. GitHub Releases are the distribution
 channel; no npm publishing credentials are required. Live WeChat QR login and

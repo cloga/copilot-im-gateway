@@ -1,6 +1,6 @@
 {
   "name": "@cloga/copilot-im-gateway",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "description": "Secure local-first IM gateway for GitHub Copilot",
   "type": "module",
@@ -16,6 +16,8 @@
     "extension:install": "node scripts/install-user-extension.mjs",
     "lint": "eslint .",
     "release:package": "node scripts/package-release.mjs",
+    "release:installer": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/installer/build-windows-installer.ps1",
+    "release:installer:smoke": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/installer/smoke-windows-installer.ps1",
     "release:validate": "node scripts/validate-release.mjs",
     "release:verify": "node scripts/verify-release.mjs",
     "test": "vitest run",
