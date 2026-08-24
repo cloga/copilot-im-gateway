@@ -35,6 +35,7 @@ jobs:
           name: copilot-im-gateway-${{ github.ref_name }}
           path: |
             release/*.tgz
+            release/*.zip
             release/*.sha256
           if-no-files-found: error
       - name: Publish GitHub Release
@@ -42,7 +43,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: >-
           gh release create "${GITHUB_REF_NAME}"
-          release/*.tgz release/*.sha256
+          release/*.tgz release/*.zip release/*.sha256
           --verify-tag
           --generate-notes
           --title "Copilot IM Gateway ${GITHUB_REF_NAME}"

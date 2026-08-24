@@ -28,16 +28,19 @@ through the official GitHub Copilot SDK extension runtime.
 Prerequisites: Windows PowerShell, Node.js 22.12+ (excluding 23.x) or 24+, npm,
 and GitHub Copilot CLI/App 1.0.80+.
 
-1. Download `copilot-im-gateway-v<VERSION>.tgz` and its `.sha256` file from
+### Windows
+
+1. Download `copilot-im-gateway-v0.1.1-windows.zip` and
+   `copilot-im-gateway-v0.1.1-windows.zip.sha256` from
    [GitHub Releases](https://github.com/cloga/copilot-im-gateway/releases).
 2. Verify and extract the archive:
 
    ```powershell
-   $archive = "copilot-im-gateway-v0.1.0.tgz"
+   $archive = "copilot-im-gateway-v0.1.1-windows.zip"
    $expected = (Get-Content "$archive.sha256").Split()[0]
    $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant()
    if ($actual -ne $expected) { throw "Release checksum mismatch" }
-   tar -xzf $archive
+   Expand-Archive $archive -DestinationPath .
    Set-Location package
    ```
 
@@ -52,6 +55,21 @@ and GitHub Copilot CLI/App 1.0.80+.
    ```powershell
    & "$HOME\.copilot\im-gateway\start.ps1"
    ```
+
+The Windows ZIP contains architecture-neutral JavaScript and PowerShell scripts.
+It is not an `.exe` and does not bundle a Node.js runtime; install a supported
+Node.js version separately as listed in the prerequisites.
+
+### Cross-platform archive
+
+Cross-platform users can instead download
+`copilot-im-gateway-v0.1.1.tgz` and its `.sha256` file, verify it with their
+platform's SHA-256 tool, and extract it with:
+
+```sh
+tar -xzf copilot-im-gateway-v0.1.1.tgz
+cd package
+```
 
 The release contains compiled JavaScript, so consumers do not need TypeScript,
 development dependencies, or a local build. The installer runs
@@ -80,8 +98,8 @@ See [docs/development.md](docs/development.md) for setup and verification,
 | `npm run typecheck` | Type-check without emitting |
 | `npm test` | Run deterministic unit/integration tests |
 | `npm run build` | Compile production JavaScript |
-| `npm run release:package` | Build the release archive and SHA-256 checksum |
-| `npm run release:validate` | Validate release contents and checksum |
+| `npm run release:package` | Build the `.tgz` and Windows `.zip` archives and checksums |
+| `npm run release:validate` | Validate release contents and checksums |
 | `npm run release:verify` | Verify contents and deterministic packaging |
 | `npm run check` | Run lint, typecheck, tests, build, and release verification |
 
@@ -92,8 +110,8 @@ See [docs/development.md](docs/development.md) for setup and verification,
 3. Tag the merged commit with the matching semantic version, for example
    `v0.2.0`, and push the tag.
 4. The `Release` workflow checks the tag against `package.json`, runs the full
-   check, builds once in CI, publishes the archive and checksum, and generates
-   GitHub Release notes.
+   check, builds once in CI, publishes both archives and checksums, and
+   generates GitHub Release notes.
 
 Do not create a tag for an unmerged commit. GitHub Releases are the distribution
 channel; no npm publishing credentials are required. Live WeChat QR login and

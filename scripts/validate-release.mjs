@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFile, readdir } from "node:fs/promises";
@@ -9,7 +10,7 @@ const repositoryRoot = path.resolve(
   "..",
 );
 
-const requiredEntries = [
+export const requiredEntries = [
   "package/.env.example",
   "package/.github/extensions/im-gateway/canvas.mjs",
   "package/.github/extensions/im-gateway/extension.mjs",
@@ -28,6 +29,9 @@ const requiredEntries = [
  * @param {string} archivePath
  */
 function listArchive(archivePath) {
+  if (archivePath.endsWith(".zip")) {
+    return listZipArchive(archivePath);
+  }
   const result = spawnSync("tar", ["-tzf", archivePath], {
     encoding: "utf8",
   });
@@ -43,6 +47,50 @@ function listArchive(archivePath) {
       .map((entry) => entry.replaceAll("\\", "/").replace(/\/$/u, ""))
       .filter(Boolean),
   );
+}
+
+/**
+ * @param {string} archivePath
+ */
+function listZipArchive(archivePath) {
+  const archive = readFileSync(archivePath);
+  const endSignature = 0x06054b50;
+  let endOffset = -1;
+  for (
+    let offset = archive.length - 22;
+    offset >= Math.max(0, archive.length - 65_557);
+    offset -= 1
+  ) {
+    if (archive.readUInt32LE(offset) === endSignature) {
+      endOffset = offset;
+      break;
+    }
+  }
+  if (endOffset < 0) {
+    throw new Error("Unable to find ZIP central directory");
+  }
+
+  const entryCount = archive.readUInt16LE(endOffset + 10);
+  let offset = archive.readUInt32LE(endOffset + 16);
+  const entries = new Set();
+  for (let index = 0; index < entryCount; index += 1) {
+    if (archive.readUInt32LE(offset) !== 0x02014b50) {
+      throw new Error("Invalid ZIP central directory entry");
+    }
+    const nameLength = archive.readUInt16LE(offset + 28);
+    const extraLength = archive.readUInt16LE(offset + 30);
+    const commentLength = archive.readUInt16LE(offset + 32);
+    const name = archive
+      .subarray(offset + 46, offset + 46 + nameLength)
+      .toString("utf8")
+      .replaceAll("\\", "/")
+      .replace(/\/$/u, "");
+    if (name) {
+      entries.add(name);
+    }
+    offset += 46 + nameLength + extraLength + commentLength;
+  }
+  return entries;
 }
 
 /**
@@ -83,23 +131,23 @@ export async function validateReleaseArchive(archivePath, checksumPath) {
 async function findReleaseArchive() {
   const releaseDirectory = path.join(repositoryRoot, "release");
   const files = await readdir(releaseDirectory);
-  const archives = files.filter((file) => file.endsWith(".tgz"));
-  if (archives.length !== 1) {
+  const archives = files.filter(
+    (file) => file.endsWith(".tgz") || file.endsWith(".zip"),
+  );
+  if (archives.length !== 2) {
     throw new Error(
-      `Expected exactly one release archive, found ${archives.length}`,
+      `Expected exactly two release archives, found ${archives.length}`,
     );
   }
-  const archive = archives[0];
-  if (!archive) {
-    throw new Error("Release archive was not found");
-  }
-  return path.join(releaseDirectory, archive);
+  return archives.map((archive) => path.join(releaseDirectory, archive));
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const archivePath = process.argv[2]
-    ? path.resolve(process.argv[2])
+  const archivePaths = process.argv[2]
+    ? [path.resolve(process.argv[2])]
     : await findReleaseArchive();
-  await validateReleaseArchive(archivePath, `${archivePath}.sha256`);
-  console.error(`Validated ${archivePath}`);
+  for (const archivePath of archivePaths) {
+    await validateReleaseArchive(archivePath, `${archivePath}.sha256`);
+    console.error(`Validated ${archivePath}`);
+  }
 }
