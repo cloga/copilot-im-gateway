@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createReleaseArchive } from "./package-release.mjs";
+import { createReleaseArtifacts } from "./package-release.mjs";
 import { validateReleaseArchive } from "./validate-release.mjs";
 
 const firstDirectory = await mkdtemp(
@@ -12,19 +12,30 @@ const secondDirectory = await mkdtemp(
 );
 
 try {
-  const first = await createReleaseArchive({
+  const first = await createReleaseArtifacts({
     outputDirectory: firstDirectory,
   });
-  const second = await createReleaseArchive({
+  const second = await createReleaseArtifacts({
     outputDirectory: secondDirectory,
   });
-  await validateReleaseArchive(first.archivePath, first.checksumPath);
-  await validateReleaseArchive(second.archivePath, second.checksumPath);
-
-  if (first.digest !== second.digest) {
-    throw new Error("Release packaging is not deterministic");
+  for (const artifactName of /** @type {const} */ (["tgz", "windowsZip"])) {
+    const firstArtifact = first[artifactName];
+    const secondArtifact = second[artifactName];
+    await validateReleaseArchive(
+      firstArtifact.archivePath,
+      firstArtifact.checksumPath,
+    );
+    await validateReleaseArchive(
+      secondArtifact.archivePath,
+      secondArtifact.checksumPath,
+    );
+    if (firstArtifact.digest !== secondArtifact.digest) {
+      throw new Error(`${artifactName} release packaging is not deterministic`);
+    }
+    console.error(
+      `Verified deterministic ${artifactName} SHA-256 ${firstArtifact.digest}`,
+    );
   }
-  console.error(`Verified deterministic release SHA-256 ${first.digest}`);
 } finally {
   await Promise.all([
     rm(firstDirectory, { force: true, recursive: true }),
