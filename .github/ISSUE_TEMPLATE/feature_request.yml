@@ -1,0 +1,23 @@
+name: Feature request
+description: Propose a secure gateway capability
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and trust-boundary impact
+    validations:
+      required: true

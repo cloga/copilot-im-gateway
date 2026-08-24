@@ -1,0 +1,37 @@
+name: Bug report
+description: Report a reproducible gateway defect
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Do not include tokens, QR credentials, message bodies, or private paths.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+    validations:
+      required: true
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I removed secrets, personal data, and private paths.
+          required: true
