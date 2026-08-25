@@ -1008,7 +1008,7 @@ describe("GatewayStore durable runtime state", () => {
     store.close();
   });
 
-  it("bounds body scrubbing and preserves active messages while expiring context", () => {
+  it("retains expired context for active backlog and removes it after terminal completion", () => {
     const clock = new MutableClock();
     const databasePath = createDatabasePath();
     const store = createStore(databasePath, {
@@ -1016,7 +1016,7 @@ describe("GatewayStore durable runtime state", () => {
       cleanupBatchSize: 1,
       completedBodyRetentionHours: 1,
       failedBodyRetentionHours: 2,
-      contextTokenRetentionDays: 1,
+      contextTokenRetentionDays: 7,
       inboxRetentionDays: 30,
       auditRetentionDays: 30,
     });
@@ -1075,10 +1075,49 @@ describe("GatewayStore durable runtime state", () => {
     ]);
     inspection.close();
 
-    clock.advance(2 * 24 * 60 * 60 * 1_000);
+    leased = store.leaseInbound(
+      "session",
+      clock.now().toISOString(),
+      60,
+    );
+    store.completeInbound(
+      leased?.id ?? 0,
+      leased?.leaseId ?? "",
+      "failed",
+      "TRANSIENT",
+      true,
+      clock.now().toISOString(),
+    );
+    clock.advance(8 * 24 * 60 * 60 * 1_000);
     store.renewOwnership();
     expect(store.cleanup(clock.now().toISOString())).toMatchObject({
       bodies: 1,
+      channelState: 0,
+    });
+    expect(
+      store.getChannelState(
+        {
+          tenantId: "local",
+          channelId: "weixin-main",
+          accountId: "bot-a",
+        },
+        "context:conversation",
+      ),
+    ).toBe("fixture-context-token");
+    leased = store.leaseInbound(
+      "session",
+      clock.now().toISOString(),
+      60,
+    );
+    store.completeInbound(
+      leased?.id ?? 0,
+      leased?.leaseId ?? "",
+      "completed",
+      undefined,
+      false,
+      clock.now().toISOString(),
+    );
+    expect(store.cleanup(clock.now().toISOString())).toMatchObject({
       channelState: 1,
     });
     expect(
@@ -1105,10 +1144,10 @@ describe("GatewayStore durable runtime state", () => {
     expect(
       inspection
         .prepare(
-          "SELECT text FROM inbound_messages WHERE status = 'pending'",
+          "SELECT status FROM inbound_messages WHERE message_id = 'pending'",
         )
         .get(),
-    ).toEqual({ text: "pending body" });
+    ).toEqual({ status: "completed" });
     inspection.close();
     store.close();
   });

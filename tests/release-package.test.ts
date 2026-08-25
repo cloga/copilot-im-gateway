@@ -10,6 +10,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  rename,
   rm,
   writeFile,
 } from "node:fs/promises";
@@ -699,6 +700,10 @@ describe("release packaging", () => {
     );
     expect(credentialKeyScript).toContain("SetAccessRuleProtection($true, $false)");
     expect(credentialKeyScript).toContain(
+      "[GatewayDurableMove]::MoveFileEx",
+    );
+    expect(credentialKeyScript).toContain("$moveFileWriteThrough = 8");
+    expect(credentialKeyScript).toContain(
       "[Security.Principal.WindowsIdentity]::GetCurrent().User",
     );
     expect(credentialKeyScript).toContain("$rules.Count -ne 1");
@@ -712,6 +717,229 @@ describe("release packaging", () => {
       "Uninstaller silently removed the credential master key.",
     );
   });
+
+  it.skipIf(process.platform !== "win32")(
+    "recovers every durable Windows key-swap stage before requiring the canonical key",
+    async () => {
+      const root = await mkdtemp(
+        path.join(os.tmpdir(), "copilot-im-gateway-key-recovery-"),
+      );
+      const helper = path.resolve(
+        import.meta.dirname,
+        "..",
+        "scripts",
+        "release",
+        "credential-key.ps1",
+      );
+      const fakeNode = path.join(root, "classify-next.cmd");
+      await writeFile(fakeNode, "@exit /b 21\r\n", "utf8");
+      const invokeHelper = (
+        dataDirectory: string,
+        argumentsValue: string[] = [],
+      ): SpawnSyncReturns<string> =>
+        spawnSync(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            helper,
+            "-DataDirectory",
+            dataDirectory,
+            ...argumentsValue,
+          ],
+          {
+            encoding: "utf8",
+            timeout: slowPowerShellTimeout,
+            windowsHide: true,
+          },
+        );
+      try {
+        for (const stage of [
+          "before-first-rename",
+          "between-renames",
+          "after-second-rename",
+          "during-prior-key-retirement",
+          "after-prior-key-retirement",
+        ]) {
+          const dataDirectory = path.join(root, stage);
+          let result = invokeHelper(dataDirectory);
+          expectSpawnCompleted(result);
+          expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+          const currentPath = path.join(
+            dataDirectory,
+            "credential-master-key",
+          );
+          const nextPath = `${currentPath}.next`;
+          const previousPath = `${currentPath}.previous`;
+          const rotationPath = `${currentPath}.rotation`;
+          const journalFixturePath = `${currentPath}.journal-fixture`;
+          const oldKey = await readFile(currentPath);
+          await rename(currentPath, journalFixturePath);
+          result = invokeHelper(dataDirectory);
+          expectSpawnCompleted(result);
+          expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+          await writeFile(currentPath, oldKey);
+          result = invokeHelper(dataDirectory, ["-ProvisionNext"]);
+          expectSpawnCompleted(result);
+          expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+          const nextKey = await readFile(nextPath);
+          const journal = {
+            version: 1,
+            currentKeyId: createHash("sha256").update(oldKey).digest("hex"),
+            nextKeyId: createHash("sha256").update(nextKey).digest("hex"),
+          };
+          await rename(journalFixturePath, rotationPath);
+          await writeFile(
+            rotationPath,
+            `${JSON.stringify(journal)}\n`,
+            "utf8",
+          );
+          if (stage === "between-renames") {
+            await rename(currentPath, previousPath);
+          } else if (stage === "after-second-rename") {
+            await rename(currentPath, previousPath);
+            await rename(nextPath, currentPath);
+          } else if (stage === "during-prior-key-retirement") {
+            await rename(currentPath, previousPath);
+            await rename(nextPath, currentPath);
+            await writeFile(previousPath, Buffer.alloc(32));
+          } else if (stage === "after-prior-key-retirement") {
+            await rm(currentPath);
+            await rename(nextPath, currentPath);
+          }
+
+          result = invokeHelper(dataDirectory, [
+            "-RecoverRotation",
+            "-NodePath",
+            fakeNode,
+            "-MaintenanceEntryPoint",
+            "fixture",
+          ]);
+          expectSpawnCompleted(result);
+          expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+          await expect(readFile(currentPath)).resolves.toEqual(nextKey);
+          for (const transientPath of [
+            nextPath,
+            previousPath,
+            rotationPath,
+          ]) {
+            await expect(readFile(transientPath)).rejects.toMatchObject({
+              code: "ENOENT",
+            });
+          }
+          await expect(
+            readFile(`${currentPath}.rotation-completed`, "utf8"),
+          ).resolves.toContain(journal.nextKeyId);
+          result = invokeHelper(dataDirectory);
+          expectSpawnCompleted(result);
+          expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+        }
+        const invalidDirectory = path.join(root, "invalid-journal");
+        let invalidResult = invokeHelper(invalidDirectory);
+        expectSpawnCompleted(invalidResult);
+        expect(
+          invalidResult.status,
+          `${invalidResult.stdout}\n${invalidResult.stderr}`,
+        ).toBe(0);
+        const invalidKeyPath = path.join(
+          invalidDirectory,
+          "credential-master-key",
+        );
+        const invalidRotationPath = `${invalidKeyPath}.rotation`;
+        await rename(invalidKeyPath, invalidRotationPath);
+        await writeFile(invalidRotationPath, '{"version":1}\n', "utf8");
+        invalidResult = invokeHelper(invalidDirectory, [
+          "-RecoverRotation",
+          "-NodePath",
+          fakeNode,
+          "-MaintenanceEntryPoint",
+          "fixture",
+        ]);
+        expectSpawnCompleted(invalidResult);
+        expect(
+          invalidResult.status,
+          `${invalidResult.stdout}\n${invalidResult.stderr}`,
+        ).not.toBe(0);
+        await expect(readFile(invalidKeyPath)).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+        await expect(
+          readFile(invalidRotationPath, "utf8"),
+        ).resolves.toBe('{"version":1}\n');
+
+        const malformedDirectory = path.join(root, "malformed-next-path");
+        let malformedResult = invokeHelper(malformedDirectory);
+        expectSpawnCompleted(malformedResult);
+        expect(
+          malformedResult.status,
+          `${malformedResult.stdout}\n${malformedResult.stderr}`,
+        ).toBe(0);
+        const malformedKeyPath = path.join(
+          malformedDirectory,
+          "credential-master-key",
+        );
+        const malformedNextPath = `${malformedKeyPath}.next`;
+        const malformedRotationPath = `${malformedKeyPath}.rotation`;
+        const malformedFixturePath = `${malformedKeyPath}.journal-fixture`;
+        const malformedOldKey = await readFile(malformedKeyPath);
+        await rename(malformedKeyPath, malformedFixturePath);
+        malformedResult = invokeHelper(malformedDirectory);
+        expectSpawnCompleted(malformedResult);
+        expect(
+          malformedResult.status,
+          `${malformedResult.stdout}\n${malformedResult.stderr}`,
+        ).toBe(0);
+        await writeFile(malformedKeyPath, malformedOldKey);
+        malformedResult = invokeHelper(malformedDirectory, ["-ProvisionNext"]);
+        expectSpawnCompleted(malformedResult);
+        expect(
+          malformedResult.status,
+          `${malformedResult.stdout}\n${malformedResult.stderr}`,
+        ).toBe(0);
+        const malformedNextKey = await readFile(malformedNextPath);
+        await rename(malformedFixturePath, malformedRotationPath);
+        await writeFile(
+          malformedRotationPath,
+          `${JSON.stringify({
+            version: 1,
+            currentKeyId: createHash("sha256")
+              .update(malformedOldKey)
+              .digest("hex"),
+            nextKeyId: createHash("sha256")
+              .update(malformedNextKey)
+              .digest("hex"),
+          })}\n`,
+          "utf8",
+        );
+        await rm(malformedNextPath);
+        await mkdir(malformedNextPath);
+        malformedResult = invokeHelper(malformedDirectory, [
+          "-RecoverRotation",
+          "-NodePath",
+          fakeNode,
+          "-MaintenanceEntryPoint",
+          "fixture",
+        ]);
+        expectSpawnCompleted(malformedResult);
+        expect(
+          malformedResult.status,
+          `${malformedResult.stdout}\n${malformedResult.stderr}`,
+        ).not.toBe(0);
+        await expect(readFile(malformedKeyPath)).resolves.toEqual(
+          malformedOldKey,
+        );
+        await expect(
+          readFile(malformedRotationPath, "utf8"),
+        ).resolves.toContain("nextKeyId");
+      } finally {
+        await rm(root, { force: true, recursive: true });
+      }
+    },
+    60_000,
+  );
 
   it.skipIf(process.platform !== "win32")(
     "does not disclose the token or trust shutdown responses from an unknown listener",

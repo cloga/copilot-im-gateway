@@ -250,13 +250,22 @@ export class GatewayStore {
         Math.max(1, Math.floor(options.cleanupBatchSize ?? 500)),
       ),
     };
+    let initialized = false;
     try {
       this.#database.exec(
         "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON; PRAGMA busy_timeout = 2500;",
       );
       this.#initializeOwnedSchema();
-      this.#database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+      initialized = true;
+      this.#checkpointSensitiveWrites();
     } catch (error) {
+      if (initialized) {
+        this.#database
+          .prepare(
+            "DELETE FROM gateway_ownership WHERE singleton = 1 AND owner_token = ?",
+          )
+          .run(this.#ownerToken);
+      }
       this.#database.close();
       this.#secretCipher.destroy();
       throw error;
@@ -2540,7 +2549,8 @@ export class GatewayStore {
     if (
       row === undefined ||
       (row.expires_at !== null &&
-        row.expires_at <= this.#clock.now().toISOString())
+        row.expires_at <= this.#clock.now().toISOString() &&
+        !this.#hasActiveContextDependency(identity, key))
     ) {
       return undefined;
     }
@@ -2757,9 +2767,33 @@ export class GatewayStore {
         .prepare(
           `DELETE FROM channel_state
            WHERE rowid IN (
-             SELECT rowid FROM channel_state
-             WHERE expires_at IS NOT NULL AND expires_at <= ?
-             ORDER BY expires_at, rowid
+             SELECT state.rowid FROM channel_state state
+             WHERE state.expires_at IS NOT NULL AND state.expires_at <= ?
+               AND (
+                 state.state_key NOT LIKE 'context:%'
+                 OR (
+                   NOT EXISTS (
+                     SELECT 1 FROM inbound_messages message
+                     WHERE message.tenant_id = state.tenant_id
+                       AND message.channel_id = state.channel_id
+                       AND message.account_id = state.account_id
+                       AND message.conversation_id = substr(state.state_key, 9)
+                       AND message.status IN ('pending','leased','retry_wait')
+                   )
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM session_bindings binding
+                     JOIN inbound_admissions admission
+                       ON admission.route_key = binding.route_key
+                     WHERE binding.tenant_id = state.tenant_id
+                       AND binding.channel_id = state.channel_id
+                       AND binding.account_id = state.account_id
+                       AND binding.conversation_id = substr(state.state_key, 9)
+                       AND admission.disposition = 'reserved'
+                   )
+                 )
+               )
+             ORDER BY state.expires_at, state.rowid
              LIMIT ?
            )`,
         )
@@ -2846,8 +2880,57 @@ export class GatewayStore {
     const checkpoint = this.#database
       .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
       .get() as { busy: number; log: number; checkpointed: number };
-    if (checkpoint.busy !== 0 || checkpoint.log !== checkpoint.checkpointed) {
+    if (
+      checkpoint.busy !== 0 ||
+      checkpoint.log !== 0 ||
+      checkpoint.checkpointed !== 0
+    ) {
       throw new Error("Sensitive data checkpoint could not complete.");
     }
+  }
+
+  #hasActiveContextDependency(
+    identity: ChannelAccountIdentity,
+    key: string,
+  ): boolean {
+    if (!key.startsWith("context:")) {
+      return false;
+    }
+    const conversationId = key.slice("context:".length);
+    return (
+      this.#database
+        .prepare(
+          `SELECT 1
+           WHERE EXISTS (
+             SELECT 1 FROM inbound_messages message
+             WHERE message.tenant_id = ?
+               AND message.channel_id = ?
+               AND message.account_id = ?
+               AND message.conversation_id = ?
+               AND message.status IN ('pending','leased','retry_wait')
+           )
+           OR EXISTS (
+             SELECT 1
+             FROM session_bindings binding
+             JOIN inbound_admissions admission
+               ON admission.route_key = binding.route_key
+             WHERE binding.tenant_id = ?
+               AND binding.channel_id = ?
+               AND binding.account_id = ?
+               AND binding.conversation_id = ?
+               AND admission.disposition = 'reserved'
+           )`,
+        )
+        .get(
+          identity.tenantId,
+          identity.channelId,
+          identity.accountId,
+          conversationId,
+          identity.tenantId,
+          identity.channelId,
+          identity.accountId,
+          conversationId,
+        ) !== undefined
+    );
   }
 }

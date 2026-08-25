@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdtempSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -21,10 +22,13 @@ import {
   FileMasterKeyStorage,
   keyId,
   loadOrCreateMasterKey,
+  parseRotationJournal,
   recoverInterruptedRotation,
   resolveMasterKeyPaths,
   writeRotationJournal,
   type MasterKeyStorage,
+  type RotationDurability,
+  type RotationJournal,
 } from "../src/daemon/master-key.js";
 import { rotateCredentialMasterKey } from "../src/daemon/maintenance.js";
 import { GatewayStore } from "../src/daemon/store.js";
@@ -116,6 +120,34 @@ class MemoryKeyStorage implements MasterKeyStorage {
   }
 }
 
+class TestRotationDurability implements RotationDurability {
+  #operation = 0;
+
+  constructor(private readonly failAfterOperation?: number) {}
+
+  writeJournal(rotationPath: string, journal: RotationJournal): void {
+    writeRotationJournal(rotationPath, journal);
+    this.#completeOperation();
+  }
+
+  rename(sourcePath: string, destinationPath: string): void {
+    renameSync(sourcePath, destinationPath);
+    this.#completeOperation();
+  }
+
+  remove(filePath: string): void {
+    rmSync(filePath);
+    this.#completeOperation();
+  }
+
+  #completeOperation(): void {
+    this.#operation += 1;
+    if (this.#operation === this.failAfterOperation) {
+      throw new Error("injected directory sync failure");
+    }
+  }
+}
+
 afterEach(() => {
   for (const directory of directories.splice(0)) {
     rmSync(directory, { recursive: true, force: true });
@@ -196,6 +228,44 @@ describe("credential state protection", () => {
       store.getChannelState(identity, "context:sender-a"),
     ).toBe("fixture-context-token");
     store.close();
+  });
+
+  it("fails startup when a reader prevents complete migration checkpointing and retries", () => {
+    const directory = temporaryDirectory();
+    const databasePath = path.join(directory, "gateway.sqlite");
+    const key = Buffer.alloc(32, 15);
+    createVersionThreeDatabase(databasePath);
+    const setup = new DatabaseSync(databasePath);
+    setup.exec("PRAGMA journal_mode = WAL");
+    setup.close();
+    const reader = new DatabaseSync(databasePath, { readOnly: true });
+    reader.exec("BEGIN");
+    expect(
+      reader
+        .prepare("SELECT value_json FROM channel_state WHERE state_key = ?")
+        .get("credentials"),
+    ).toBeDefined();
+
+    try {
+      expect(() => new GatewayStore(databasePath, { secretKey: key })).toThrow(
+        "checkpoint could not complete",
+      );
+      expect(readFileSync(`${databasePath}-wal`).byteLength).toBeGreaterThan(0);
+    } finally {
+      reader.exec("ROLLBACK");
+      reader.close();
+    }
+
+    const recovered = new GatewayStore(databasePath, { secretKey: key });
+    expect(
+      recovered.getChannelState<{ botToken: string }>(identity, "credentials")
+        ?.botToken,
+    ).toBe("fixture-secret-token");
+    recovered.close();
+    expect(
+      !existsSync(`${databasePath}-wal`) ||
+        readFileSync(`${databasePath}-wal`).byteLength === 0,
+    ).toBe(true);
   });
 
   it("rolls back a failed migration and retries with the durable key", () => {
@@ -342,6 +412,7 @@ describe("credential state protection", () => {
       paths,
       databasePath,
       new FileMasterKeyStorage("win32", { NODE_ENV: "test" }),
+      new TestRotationDurability(),
     );
     expect(readFileSync(paths.keyPath)).toEqual(newKey);
     expect(existsSync(paths.nextKeyPath)).toBe(false);
@@ -356,6 +427,23 @@ describe("credential state protection", () => {
       )?.botToken,
     ).toBe("fixture-secret-token");
     recovered.close();
+  });
+
+  it("rejects malicious or incomplete rotation journals without changing keys", () => {
+    const oldKey = Buffer.alloc(32, 20);
+    for (const journal of [
+      '{"version":1,"currentKeyId":"invalid"}\n',
+      `${JSON.stringify({
+        version: 1,
+        currentKeyId: keyId(oldKey),
+        nextKeyId: "a".repeat(64),
+        keyPath: "C:\\attacker-controlled",
+      })}\n`,
+    ]) {
+      expect(() => parseRotationJournal(journal)).toThrow(
+        "rotation journal is invalid",
+      );
+    }
   });
 
   it("rotates the durable key through the offline maintenance operation", () => {
@@ -379,7 +467,14 @@ describe("credential state protection", () => {
     store.close();
 
     expect(
-      rotateCredentialMasterKey(directory, { NODE_ENV: "test" }),
+      rotateCredentialMasterKey(
+        directory,
+        { NODE_ENV: "test" },
+        {
+          durability: new TestRotationDurability(),
+          platform: "win32",
+        },
+      ),
     ).toBe(1);
     const walPath = `${databasePath}-wal`;
     expect(
@@ -396,6 +491,139 @@ describe("credential state protection", () => {
     ).toBe("fixture-secret-token");
     rotated.close();
   });
+
+  it("does not re-encrypt before the rotation journal directory barrier", () => {
+    const directory = temporaryDirectory();
+    const databasePath = path.join(directory, "gateway.sqlite");
+    const paths = resolveMasterKeyPaths(directory);
+    const oldKey = Buffer.alloc(32, 16);
+    const newKey = Buffer.alloc(32, 17);
+    writeFileSync(paths.keyPath, oldKey);
+    writeFileSync(paths.nextKeyPath, newKey);
+    const store = new GatewayStore(databasePath, { secretKey: oldKey });
+    store.setChannelState(
+      identity,
+      "credentials",
+      { botToken: "fixture-secret-token" },
+      "2026-08-25T00:00:00.000Z",
+    );
+    store.close();
+
+    expect(() =>
+      rotateCredentialMasterKey(
+        directory,
+        { NODE_ENV: "test" },
+        {
+          durability: new TestRotationDurability(1),
+          platform: "win32",
+        },
+      ),
+    ).toThrow("directory sync failure");
+    const unchanged = new GatewayStore(databasePath, { secretKey: oldKey });
+    unchanged.close();
+
+    recoverInterruptedRotation(
+      paths,
+      databasePath,
+      new FileMasterKeyStorage("win32", { NODE_ENV: "test" }),
+      new TestRotationDurability(),
+    );
+    expect(readFileSync(paths.keyPath)).toEqual(oldKey);
+    expect(existsSync(paths.nextKeyPath)).toBe(false);
+    expect(existsSync(paths.rotationPath)).toBe(false);
+  });
+
+  it("recovers an interrupted offline rotation before accepting another request", () => {
+    const directory = temporaryDirectory();
+    const databasePath = path.join(directory, "gateway.sqlite");
+    const paths = resolveMasterKeyPaths(directory);
+    const oldKey = Buffer.alloc(32, 21);
+    const newKey = Buffer.alloc(32, 22);
+    writeFileSync(paths.keyPath, oldKey);
+    writeFileSync(paths.nextKeyPath, newKey);
+    const store = new GatewayStore(databasePath, { secretKey: oldKey });
+    store.setChannelState(
+      identity,
+      "credentials",
+      { botToken: "fixture-secret-token" },
+      "2026-08-25T00:00:00.000Z",
+    );
+    store.close();
+
+    expect(() =>
+      rotateCredentialMasterKey(
+        directory,
+        { NODE_ENV: "test" },
+        {
+          durability: new TestRotationDurability(2),
+          platform: "win32",
+        },
+      ),
+    ).toThrow("directory sync failure");
+    expect(existsSync(paths.keyPath)).toBe(false);
+    expect(
+      rotateCredentialMasterKey(
+        directory,
+        { NODE_ENV: "test" },
+        {
+          durability: new TestRotationDurability(),
+          platform: "win32",
+        },
+      ),
+    ).toBe(0);
+    expect(readFileSync(paths.keyPath)).toEqual(newKey);
+    const recovered = new GatewayStore(databasePath, { secretKey: newKey });
+    recovered.close();
+  });
+
+  it.each([1, 2, 3, 4])(
+    "repeats committed rotation recovery after durability failure %s",
+    (failureOperation) => {
+      const directory = temporaryDirectory();
+      const databasePath = path.join(directory, "gateway.sqlite");
+      const paths = resolveMasterKeyPaths(directory);
+      const oldKey = Buffer.alloc(32, 18);
+      const newKey = Buffer.alloc(32, 19);
+      writeFileSync(paths.keyPath, oldKey);
+      writeFileSync(paths.nextKeyPath, newKey);
+      const store = new GatewayStore(databasePath, { secretKey: oldKey });
+      store.setChannelState(
+        identity,
+        "credentials",
+        { botToken: "fixture-secret-token" },
+        "2026-08-25T00:00:00.000Z",
+      );
+      store.rotateSecrets(new AesGcmSecretCipher(newKey));
+      store.close();
+      writeRotationJournal(paths.rotationPath, {
+        version: 1,
+        currentKeyId: keyId(oldKey),
+        nextKeyId: keyId(newKey),
+      });
+      const storage = new FileMasterKeyStorage("win32", { NODE_ENV: "test" });
+
+      expect(() =>
+        recoverInterruptedRotation(
+          paths,
+          databasePath,
+          storage,
+          new TestRotationDurability(failureOperation),
+        ),
+      ).toThrow("directory sync failure");
+      recoverInterruptedRotation(
+        paths,
+        databasePath,
+        storage,
+        new TestRotationDurability(),
+      );
+      expect(readFileSync(paths.keyPath)).toEqual(newKey);
+      expect(existsSync(paths.nextKeyPath)).toBe(false);
+      expect(existsSync(paths.previousKeyPath)).toBe(false);
+      expect(existsSync(paths.rotationPath)).toBe(false);
+      const recovered = new GatewayStore(databasePath, { secretKey: newKey });
+      recovered.close();
+    },
+  );
 
   it("requires explicit verified Windows ACL attestation", () => {
     const directory = temporaryDirectory();

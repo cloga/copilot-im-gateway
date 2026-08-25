@@ -42,6 +42,18 @@ export interface LoadMasterKeyOptions {
   createRandomKey?: () => Buffer;
 }
 
+export interface RotationJournal {
+  version: 1;
+  currentKeyId: string;
+  nextKeyId: string;
+}
+
+export interface RotationDurability {
+  writeJournal(rotationPath: string, journal: RotationJournal): void;
+  rename(sourcePath: string, destinationPath: string): void;
+  remove(filePath: string): void;
+}
+
 export function resolveMasterKeyPaths(dataDirectory: string): MasterKeyPaths {
   const keyPath = path.join(dataDirectory, "credential-master-key");
   return {
@@ -65,6 +77,7 @@ export function loadOrCreateMasterKey(options: LoadMasterKeyOptions): Buffer {
       resolveMasterKeyPaths(path.dirname(options.keyPath)),
       options.databasePath,
       storage,
+      new FileRotationDurability(platform),
     );
   }
   const existing = storage.read(options.keyPath);
@@ -88,139 +101,219 @@ export function loadOrCreateMasterKey(options: LoadMasterKeyOptions): Buffer {
   }
 }
 
-interface RotationJournal {
-    version: 1;
-    currentKeyId: string;
-    nextKeyId: string;
-  }
-
 export function recoverInterruptedRotation(
-    paths: MasterKeyPaths,
-    databasePath: string,
-    storage: MasterKeyStorage,
-  ): void {
-    if (!existsSync(paths.rotationPath)) {
-      return;
-    }
-    const journal = parseRotationJournal(
-      readFileSync(paths.rotationPath, "utf8"),
-    );
-    const databaseKeyId = readDatabaseCredentialKeyId(databasePath);
-    const current = storage.read(paths.keyPath);
-    const next = storage.read(paths.nextKeyPath);
-    const previous = storage.read(paths.previousKeyPath);
-    try {
-      if (databaseKeyId === journal.currentKeyId) {
-        if (current === undefined || keyId(current) !== journal.currentKeyId) {
-          throw new Error("Credential rotation recovery cannot find the current key.");
-        }
-        rmSync(paths.nextKeyPath, { force: true });
-        rmSync(paths.previousKeyPath, { force: true });
-        rmSync(paths.rotationPath);
-        return;
-      }
-      if (databaseKeyId !== journal.nextKeyId) {
+  paths: MasterKeyPaths,
+  databasePath: string,
+  storage: MasterKeyStorage,
+  durability: RotationDurability = new FileRotationDurability(),
+): void {
+  if (!existsSync(paths.rotationPath)) {
+    return;
+  }
+  const journal = parseRotationJournal(
+    readFileSync(paths.rotationPath, "utf8"),
+  );
+  const databaseKeyId = readDatabaseCredentialKeyId(databasePath);
+  const current = storage.read(paths.keyPath);
+  const next = storage.read(paths.nextKeyPath);
+  const previous = storage.read(paths.previousKeyPath);
+  try {
+    const currentId = current === undefined ? undefined : keyId(current);
+    const nextId = next === undefined ? undefined : keyId(next);
+    const previousId = previous === undefined ? undefined : keyId(previous);
+    if (databaseKeyId === journal.currentKeyId) {
+      if (
+        currentId !== journal.currentKeyId ||
+        previousId !== undefined ||
+        (nextId !== undefined && nextId !== journal.nextKeyId)
+      ) {
         throw new Error(
-          "Credential rotation journal does not match the gateway database.",
+          "Credential rotation recovery found an invalid rollback state.",
         );
       }
-      if (current !== undefined && keyId(current) === journal.nextKeyId) {
-        rmSync(paths.nextKeyPath, { force: true });
-      } else {
-        if (next === undefined || keyId(next) !== journal.nextKeyId) {
-          throw new Error("Credential rotation recovery cannot find the next key.");
-        }
-        if (current !== undefined) {
-          if (keyId(current) !== journal.currentKeyId) {
-            throw new Error(
-              "Credential rotation recovery found an unexpected current key.",
-            );
-          }
-          renameSync(paths.keyPath, paths.previousKeyPath);
-        } else if (
-          previous === undefined ||
-          keyId(previous) !== journal.currentKeyId
-        ) {
-          throw new Error(
-            "Credential rotation recovery cannot prove the prior key identity.",
-          );
-        }
-        renameSync(paths.nextKeyPath, paths.keyPath);
+      if (nextId !== undefined) {
+        durability.remove(paths.nextKeyPath);
       }
-      rmSync(paths.previousKeyPath, { force: true });
-      rmSync(paths.rotationPath);
-    } finally {
-      current?.fill(0);
-      next?.fill(0);
-      previous?.fill(0);
+      durability.remove(paths.rotationPath);
+      return;
+    }
+    if (databaseKeyId !== journal.nextKeyId) {
+      throw new Error(
+        "Credential rotation journal does not match the gateway database.",
+      );
+    }
+    const beforeSwap =
+      currentId === journal.currentKeyId &&
+      nextId === journal.nextKeyId &&
+      previousId === undefined;
+    const betweenRenames =
+      currentId === undefined &&
+      nextId === journal.nextKeyId &&
+      previousId === journal.currentKeyId;
+    const afterSwap =
+      currentId === journal.nextKeyId &&
+      nextId === undefined &&
+      previousId === journal.currentKeyId;
+    const afterPriorKeyRemoval =
+      currentId === journal.nextKeyId &&
+      nextId === undefined &&
+      previousId === undefined;
+    if (
+      !beforeSwap &&
+      !betweenRenames &&
+      !afterSwap &&
+      !afterPriorKeyRemoval
+    ) {
+      throw new Error(
+        "Credential rotation recovery found an invalid committed state.",
+      );
+    }
+    if (beforeSwap) {
+      durability.rename(paths.keyPath, paths.previousKeyPath);
+    }
+    if (beforeSwap || betweenRenames) {
+      durability.rename(paths.nextKeyPath, paths.keyPath);
+    }
+    if (beforeSwap || betweenRenames || afterSwap) {
+      durability.remove(paths.previousKeyPath);
+    }
+    durability.remove(paths.rotationPath);
+  } finally {
+    current?.fill(0);
+    next?.fill(0);
+    previous?.fill(0);
+  }
+}
+
+export function writeRotationJournal(
+  rotationPath: string,
+  journal: RotationJournal,
+): void {
+  const temporaryPath = `${rotationPath}.create-${process.pid}-${randomBytes(8).toString("hex")}`;
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(temporaryPath, "wx", 0o600);
+    fchmodSync(descriptor, 0o600);
+    writeFileSync(descriptor, `${JSON.stringify(journal)}\n`, "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    linkSync(temporaryPath, rotationPath);
+  } finally {
+    if (descriptor !== undefined) {
+      closeSync(descriptor);
+    }
+    rmSync(temporaryPath, { force: true });
+  }
+}
+
+export function readDatabaseCredentialKeyId(
+  databasePath: string,
+): string | undefined {
+  if (!existsSync(databasePath)) {
+    return undefined;
+  }
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    if (
+      database
+        .prepare(
+          `SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = 'gateway_metadata'`,
+        )
+        .get() === undefined
+    ) {
+      return undefined;
+    }
+    return (
+      database
+        .prepare(
+          `SELECT metadata_value FROM gateway_metadata
+             WHERE metadata_key = 'credential_key_id'`,
+        )
+        .get() as { metadata_value: string } | undefined
+    )?.metadata_value;
+  } finally {
+    database.close();
+  }
+}
+
+export function keyId(key: Uint8Array): string {
+  return createHash("sha256").update(key).digest("hex");
+}
+
+export function parseRotationJournal(value: string): RotationJournal {
+  const parsed: unknown = JSON.parse(value);
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    Array.isArray(parsed) ||
+    Object.keys(parsed).sort().join(",") !==
+      "currentKeyId,nextKeyId,version" ||
+    !("version" in parsed) ||
+    parsed.version !== 1 ||
+    !("currentKeyId" in parsed) ||
+    typeof parsed.currentKeyId !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(parsed.currentKeyId) ||
+    !("nextKeyId" in parsed) ||
+    typeof parsed.nextKeyId !== "string" ||
+    !/^[a-f0-9]{64}$/u.test(parsed.nextKeyId) ||
+    parsed.currentKeyId === parsed.nextKeyId
+  ) {
+    throw new Error("Credential rotation journal is invalid.");
+  }
+  return {
+    version: 1,
+    currentKeyId: parsed.currentKeyId,
+    nextKeyId: parsed.nextKeyId,
+  };
+}
+
+export class FileRotationDurability implements RotationDurability {
+  readonly #platform: NodeJS.Platform;
+
+  constructor(platform: NodeJS.Platform = process.platform) {
+    this.#platform = platform;
+  }
+
+  writeJournal(rotationPath: string, journal: RotationJournal): void {
+    this.#requirePosix();
+    writeRotationJournal(rotationPath, journal);
+    this.#syncParent(rotationPath);
+  }
+
+  rename(sourcePath: string, destinationPath: string): void {
+    this.#requirePosix();
+    if (path.dirname(sourcePath) !== path.dirname(destinationPath)) {
+      throw new Error("Credential rotation paths must share one directory.");
+    }
+    renameSync(sourcePath, destinationPath);
+    this.#syncParent(destinationPath);
+  }
+
+  remove(filePath: string): void {
+    this.#requirePosix();
+    rmSync(filePath);
+    this.#syncParent(filePath);
+  }
+
+  #requirePosix(): void {
+    if (this.#platform === "win32") {
+      throw new Error(
+        "Windows credential rotation requires the bundled durable ACL helper.",
+      );
     }
   }
 
-export function writeRotationJournal(
-    rotationPath: string,
-    journal: RotationJournal,
-  ): void {
-    const descriptor = openSync(rotationPath, "wx", 0o600);
+  #syncParent(filePath: string): void {
+    const descriptor = openSync(path.dirname(filePath), "r");
     try {
-      writeFileSync(descriptor, `${JSON.stringify(journal)}\n`, "utf8");
       fsyncSync(descriptor);
     } finally {
       closeSync(descriptor);
     }
   }
-
-export function readDatabaseCredentialKeyId(
-    databasePath: string,
-  ): string | undefined {
-    if (!existsSync(databasePath)) {
-      return undefined;
-    }
-    const database = new DatabaseSync(databasePath, { readOnly: true });
-    try {
-      if (
-        database
-          .prepare(
-            `SELECT 1 FROM sqlite_master
-             WHERE type = 'table' AND name = 'gateway_metadata'`,
-          )
-          .get() === undefined
-      ) {
-        return undefined;
-      }
-      return (
-        database
-          .prepare(
-            `SELECT metadata_value FROM gateway_metadata
-             WHERE metadata_key = 'credential_key_id'`,
-          )
-          .get() as { metadata_value: string } | undefined
-      )?.metadata_value;
-    } finally {
-      database.close();
-    }
-  }
-
-export function keyId(key: Uint8Array): string {
-    return createHash("sha256").update(key).digest("hex");
-  }
-
-function parseRotationJournal(value: string): RotationJournal {
-    const parsed = JSON.parse(value) as Partial<RotationJournal>;
-    if (
-      parsed.version !== 1 ||
-      typeof parsed.currentKeyId !== "string" ||
-      !/^[a-f0-9]{64}$/u.test(parsed.currentKeyId) ||
-      typeof parsed.nextKeyId !== "string" ||
-      !/^[a-f0-9]{64}$/u.test(parsed.nextKeyId)
-    ) {
-      throw new Error("Credential rotation journal is invalid.");
-    }
-    return {
-      version: 1,
-      currentKeyId: parsed.currentKeyId,
-      nextKeyId: parsed.nextKeyId,
-    };
-  }
+}
 export function databaseRequiresMasterKey(databasePath: string): boolean {
   if (!existsSync(databasePath)) {
     return false;

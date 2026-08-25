@@ -61,19 +61,32 @@ cleanup, independent of inbox and audit retention. Unique unauthorized message
 IDs therefore cannot grow SQLite state. Terminal inbox metadata is retained for
 14 days and audit metadata for 30 days by default. Completed message bodies are
 scrubbed after 24 hours, failed bodies after 72 hours, and context tokens expire
-after seven days. Cleanup is transactional, capped at 500 records of each kind
-per pass, and never removes or scrubs pending, leased, or retry-wait messages.
+after seven days. An expired context token remains available while its exact
+tenant/channel/account/conversation still has pending, leased, retry-wait, or
+reserved work; it is removed only after that work becomes terminal. Cleanup is
+transactional, capped at 500 records of each kind per pass, and never removes
+or scrubs active messages.
 
 Schema version 4 migrates v2/v3 plaintext channel records in one SQLite
 transaction only after the key is durable. Restart repeats an interrupted
-migration safely. Ambiguous v1 state without account identity remains
-quarantined and cannot become active; the operator must log in again. Exporting
-or copying SQLite yields only authenticated envelopes, not plaintext.
+migration safely. Startup requires a fully successful truncating WAL checkpoint
+after migration or secret rewrites; a reader that pins sensitive WAL frames
+causes startup to fail closed and a later restart can retry. Ambiguous v1 state
+without account identity remains quarantined and cannot become active; the
+operator must log in again. Exporting or copying SQLite yields only
+authenticated envelopes, not plaintext.
 
 Offline rotation uses `dist/daemon/maintenance.js rotate-credential-key
-<data-directory>` after provisioning `credential-master-key.next`. The daemon
-must be stopped; SQLite ownership rejects a live owner. A durable journal and
-database key ID make every interruption resolve to exactly the old or new key.
+<data-directory>` on POSIX. On Windows use `credential-key.ps1 -Rotate
+-NodePath <node.exe> -MaintenanceEntryPoint
+<dist\daemon\maintenance.js>`. The daemon must be stopped; SQLite ownership
+rejects a live owner. POSIX fsyncs the journal's parent before re-encryption and
+after every rename or removal. Windows uses `MoveFileEx` with
+`MOVEFILE_WRITE_THROUGH`, verifies each result and ACL, and retires old key
+material only after flushing zeros. A strict journal and database key ID make
+every interruption resolve to exactly the old or new key. The Windows launcher
+validates and completes a journaled crash state before enforcing the canonical
+key path, so a crash between either key rename remains restart-safe.
 
 ## Installer shutdown trust
 
