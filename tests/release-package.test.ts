@@ -9,6 +9,7 @@ import { realpathSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
+  link,
   readFile,
   rename,
   rm,
@@ -732,10 +733,13 @@ describe("release packaging", () => {
         "credential-key.ps1",
       );
       const fakeNode = path.join(root, "classify-next.cmd");
+      const fakeCurrentNode = path.join(root, "classify-current.cmd");
       await writeFile(fakeNode, "@exit /b 21\r\n", "utf8");
+      await writeFile(fakeCurrentNode, "@exit /b 20\r\n", "utf8");
       const invokeHelper = (
         dataDirectory: string,
         argumentsValue: string[] = [],
+        environment: NodeJS.ProcessEnv = {},
       ): SpawnSyncReturns<string> =>
         spawnSync(
           "powershell.exe",
@@ -752,17 +756,19 @@ describe("release packaging", () => {
           ],
           {
             encoding: "utf8",
+            env: { ...process.env, ...environment },
             timeout: slowPowerShellTimeout,
             windowsHide: true,
           },
         );
       try {
         for (const stage of [
-          "before-first-rename",
+          "before-retirement-move",
           "between-renames",
-          "after-second-rename",
-          "during-prior-key-retirement",
-          "after-prior-key-retirement",
+          "after-canonical-rename",
+          "wiping-intact-marker",
+          "wiping-partial-marker",
+          "after-marker-delete",
         ]) {
           const dataDirectory = path.join(root, stage);
           let result = invokeHelper(dataDirectory);
@@ -786,10 +792,24 @@ describe("release packaging", () => {
           expectSpawnCompleted(result);
           expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
           const nextKey = await readFile(nextPath);
+          const currentKeyId = createHash("sha256")
+            .update(oldKey)
+            .digest("hex");
+          const retirementMarker = `credential-master-key.retire-${currentKeyId}`;
+          const retirementPath = path.join(
+            dataDirectory,
+            retirementMarker,
+          );
           const journal = {
-            version: 1,
-            currentKeyId: createHash("sha256").update(oldKey).digest("hex"),
+            version: 2,
+            currentKeyId,
             nextKeyId: createHash("sha256").update(nextKey).digest("hex"),
+            retirementMarker,
+            retirementKeyId: currentKeyId,
+            retirementState: stage.startsWith("wiping-") ||
+              stage === "after-marker-delete"
+              ? "wiping"
+              : "prepared",
           };
           await rename(journalFixturePath, rotationPath);
           await writeFile(
@@ -798,17 +818,164 @@ describe("release packaging", () => {
             "utf8",
           );
           if (stage === "between-renames") {
-            await rename(currentPath, previousPath);
-          } else if (stage === "after-second-rename") {
-            await rename(currentPath, previousPath);
+            await rename(currentPath, retirementPath);
+          } else if (
+            stage === "after-canonical-rename" ||
+            stage === "wiping-intact-marker" ||
+            stage === "wiping-partial-marker"
+          ) {
+            await rename(currentPath, retirementPath);
             await rename(nextPath, currentPath);
-          } else if (stage === "during-prior-key-retirement") {
-            await rename(currentPath, previousPath);
+            if (stage === "wiping-partial-marker") {
+              await writeFile(
+                retirementPath,
+                Buffer.concat([
+                  Buffer.alloc(11),
+                  oldKey.subarray(11),
+                ]),
+              );
+            }
+          } else if (stage === "after-marker-delete") {
+            await rename(currentPath, retirementPath);
             await rename(nextPath, currentPath);
-            await writeFile(previousPath, Buffer.alloc(32));
-          } else if (stage === "after-prior-key-retirement") {
-            await rm(currentPath);
+            await rm(retirementPath);
+          }
+
+          const recoveryArguments = [
+            "-RecoverRotation",
+            "-NodePath",
+            fakeNode,
+            "-MaintenanceEntryPoint",
+            "fixture",
+          ];
+          result = invokeHelper(
+            dataDirectory,
+            recoveryArguments,
+            stage === "wiping-intact-marker"
+              ? {
+                  NODE_ENV: "test",
+                  COPILOT_IM_GATEWAY_TEST_TORN_RETIREMENT_WIPE: "1",
+                }
+              : stage === "wiping-partial-marker"
+              ? {
+                  NODE_ENV: "test",
+                  COPILOT_IM_GATEWAY_TEST_DEFER_RETIREMENT_CLEANUP: "1",
+                }
+              : {},
+          );
+          expectSpawnCompleted(result);
+          expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+          if (
+            stage === "wiping-intact-marker" ||
+            stage === "wiping-partial-marker"
+          ) {
+            await expect(readFile(currentPath)).resolves.toEqual(nextKey);
+            await expect(readFile(retirementPath)).resolves.toHaveLength(32);
+            await expect(
+              readFile(rotationPath, "utf8"),
+            ).resolves.toContain('"retirementState":"wiping"');
+            result = invokeHelper(dataDirectory, recoveryArguments);
+            expectSpawnCompleted(result);
+            expect(
+              result.status,
+              `${result.stdout}\n${result.stderr}`,
+            ).toBe(0);
+          }
+          await expect(readFile(currentPath)).resolves.toEqual(nextKey);
+          for (const transientPath of [
+            nextPath,
+            previousPath,
+            retirementPath,
+            rotationPath,
+          ]) {
+            try {
+              await readFile(transientPath);
+              throw new Error(
+                `Recovery left ${stage} artifact ${transientPath}.`,
+              );
+            } catch (error) {
+              if (
+                error instanceof Error &&
+                "code" in error &&
+                error.code === "ENOENT"
+              ) {
+                continue;
+              }
+              throw error;
+            }
+          }
+          await expect(
+            readFile(`${currentPath}.rotation-completed`, "utf8"),
+          ).resolves.toContain(journal.nextKeyId);
+          result = invokeHelper(dataDirectory);
+          expectSpawnCompleted(result);
+          expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+        }
+        for (const stage of [
+          "legacy-marker-before-canonical",
+          "legacy-marker-after-canonical",
+          "legacy-partial-previous",
+          "legacy-partial-marker",
+        ]) {
+          const dataDirectory = path.join(root, stage);
+          let result = invokeHelper(dataDirectory);
+          expectSpawnCompleted(result);
+          expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+          const currentPath = path.join(
+            dataDirectory,
+            "credential-master-key",
+          );
+          const nextPath = `${currentPath}.next`;
+          const previousPath = `${currentPath}.previous`;
+          const rotationPath = `${currentPath}.rotation`;
+          const fixturePath = `${currentPath}.journal-fixture`;
+          const oldKey = await readFile(currentPath);
+          await rename(currentPath, fixturePath);
+          result = invokeHelper(dataDirectory);
+          expectSpawnCompleted(result);
+          expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+          await writeFile(currentPath, oldKey);
+          result = invokeHelper(dataDirectory, ["-ProvisionNext"]);
+          expectSpawnCompleted(result);
+          expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+          const nextKey = await readFile(nextPath);
+          const oldKeyId = createHash("sha256").update(oldKey).digest("hex");
+          const markerPath = path.join(
+            dataDirectory,
+            `credential-master-key.retire-${oldKeyId}`,
+          );
+          await rename(fixturePath, rotationPath);
+          await writeFile(
+            rotationPath,
+            `${JSON.stringify({
+              version: 1,
+              currentKeyId: oldKeyId,
+              nextKeyId: createHash("sha256").update(nextKey).digest("hex"),
+            })}\n`,
+            "utf8",
+          );
+          await rename(currentPath, markerPath);
+          if (stage === "legacy-marker-after-canonical") {
             await rename(nextPath, currentPath);
+          } else if (stage === "legacy-partial-previous") {
+            await rename(markerPath, previousPath);
+            await rename(nextPath, currentPath);
+            await writeFile(
+              previousPath,
+              Buffer.concat([
+                Buffer.alloc(13),
+                oldKey.subarray(13),
+              ]),
+            );
+          } else if (stage === "legacy-partial-marker") {
+            await rename(nextPath, currentPath);
+            await writeFile(
+              markerPath,
+              Buffer.concat([
+                Buffer.alloc(17),
+                oldKey.subarray(17),
+              ]),
+            );
           }
 
           result = invokeHelper(dataDirectory, [
@@ -824,18 +991,100 @@ describe("release packaging", () => {
           for (const transientPath of [
             nextPath,
             previousPath,
+            markerPath,
             rotationPath,
           ]) {
             await expect(readFile(transientPath)).rejects.toMatchObject({
               code: "ENOENT",
             });
           }
-          await expect(
-            readFile(`${currentPath}.rotation-completed`, "utf8"),
-          ).resolves.toContain(journal.nextKeyId);
+        }
+        for (const version of [1, 2]) {
+          const dataDirectory = path.join(
+            root,
+            `rollback-abort-marker-v${version}`,
+          );
+          let result = invokeHelper(dataDirectory);
+          expectSpawnCompleted(result);
+          expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+          const currentPath = path.join(
+            dataDirectory,
+            "credential-master-key",
+          );
+          const nextPath = `${currentPath}.next`;
+          const rotationPath = `${currentPath}.rotation`;
+          const fixturePath = `${currentPath}.journal-fixture`;
+          const currentKey = await readFile(currentPath);
+          await rename(currentPath, fixturePath);
           result = invokeHelper(dataDirectory);
           expectSpawnCompleted(result);
           expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+          await writeFile(currentPath, currentKey);
+          result = invokeHelper(dataDirectory, ["-ProvisionNext"]);
+          expectSpawnCompleted(result);
+          expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+          const nextKey = await readFile(nextPath);
+          const currentKeyId = createHash("sha256")
+            .update(currentKey)
+            .digest("hex");
+          const nextKeyId = createHash("sha256")
+            .update(nextKey)
+            .digest("hex");
+          const abortPath = path.join(
+            dataDirectory,
+            `credential-master-key.abort-${nextKeyId}`,
+          );
+          const journal = version === 1
+            ? {
+                version: 1,
+                currentKeyId,
+                nextKeyId,
+              }
+            : {
+                version: 2,
+                currentKeyId,
+                nextKeyId,
+                retirementMarker:
+                  `credential-master-key.retire-${currentKeyId}`,
+                retirementKeyId: currentKeyId,
+                retirementState: "prepared",
+              };
+          await rename(fixturePath, rotationPath);
+          await writeFile(
+            rotationPath,
+            `${JSON.stringify(journal)}\n`,
+            "utf8",
+          );
+          if (version === 1) {
+            await writeFile(
+              nextPath,
+              Buffer.concat([
+                Buffer.alloc(9),
+                nextKey.subarray(9),
+              ]),
+            );
+          }
+          await rename(nextPath, abortPath);
+
+          result = invokeHelper(dataDirectory, [
+            "-RecoverRotation",
+            "-NodePath",
+            fakeCurrentNode,
+            "-MaintenanceEntryPoint",
+            "fixture",
+          ]);
+          expectSpawnCompleted(result);
+          expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+          await expect(readFile(currentPath)).resolves.toEqual(currentKey);
+          for (const transientPath of [
+            nextPath,
+            abortPath,
+            rotationPath,
+          ]) {
+            await expect(readFile(transientPath)).rejects.toMatchObject({
+              code: "ENOENT",
+            });
+          }
         }
         const invalidDirectory = path.join(root, "invalid-journal");
         let invalidResult = invokeHelper(invalidDirectory);
@@ -904,13 +1153,18 @@ describe("release packaging", () => {
         await writeFile(
           malformedRotationPath,
           `${JSON.stringify({
-            version: 1,
-            currentKeyId: createHash("sha256")
-              .update(malformedOldKey)
-              .digest("hex"),
+            version: 2,
+            currentKeyId: createHash("sha256").update(malformedOldKey).digest("hex"),
             nextKeyId: createHash("sha256")
               .update(malformedNextKey)
               .digest("hex"),
+            retirementMarker: `credential-master-key.retire-${createHash("sha256")
+              .update(malformedOldKey)
+              .digest("hex")}`,
+            retirementKeyId: createHash("sha256")
+              .update(malformedOldKey)
+              .digest("hex"),
+            retirementState: "prepared",
           })}\n`,
           "utf8",
         );
@@ -934,11 +1188,163 @@ describe("release packaging", () => {
         await expect(
           readFile(malformedRotationPath, "utf8"),
         ).resolves.toContain("nextKeyId");
+
+        const forgedDirectory = path.join(root, "forged-retirement-marker");
+        let forgedResult = invokeHelper(forgedDirectory);
+        expectSpawnCompleted(forgedResult);
+        expect(
+          forgedResult.status,
+          `${forgedResult.stdout}\n${forgedResult.stderr}`,
+        ).toBe(0);
+        const forgedKeyPath = path.join(
+          forgedDirectory,
+          "credential-master-key",
+        );
+        const forgedNextPath = `${forgedKeyPath}.next`;
+        const forgedRotationPath = `${forgedKeyPath}.rotation`;
+        const forgedFixturePath = `${forgedKeyPath}.journal-fixture`;
+        const forgedOldKey = await readFile(forgedKeyPath);
+        await rename(forgedKeyPath, forgedFixturePath);
+        forgedResult = invokeHelper(forgedDirectory);
+        expectSpawnCompleted(forgedResult);
+        expect(
+          forgedResult.status,
+          `${forgedResult.stdout}\n${forgedResult.stderr}`,
+        ).toBe(0);
+        await writeFile(forgedKeyPath, forgedOldKey);
+        forgedResult = invokeHelper(forgedDirectory, ["-ProvisionNext"]);
+        expectSpawnCompleted(forgedResult);
+        expect(
+          forgedResult.status,
+          `${forgedResult.stdout}\n${forgedResult.stderr}`,
+        ).toBe(0);
+        const forgedNextKey = await readFile(forgedNextPath);
+        const forgedOldKeyId = createHash("sha256")
+          .update(forgedOldKey)
+          .digest("hex");
+        const forgedMarkerName =
+          `credential-master-key.retire-${forgedOldKeyId}`;
+        const forgedMarkerPath = path.join(
+          forgedDirectory,
+          forgedMarkerName,
+        );
+        await rename(forgedFixturePath, forgedRotationPath);
+        await writeFile(
+          forgedRotationPath,
+          `${JSON.stringify({
+            version: 2,
+            currentKeyId: forgedOldKeyId,
+            nextKeyId: createHash("sha256")
+              .update(forgedNextKey)
+              .digest("hex"),
+            retirementMarker: forgedMarkerName,
+            retirementKeyId: forgedOldKeyId,
+            retirementState: "prepared",
+          })}\n`,
+          "utf8",
+        );
+        await rename(forgedKeyPath, forgedMarkerPath);
+        await writeFile(forgedMarkerPath, Buffer.alloc(32, 0x5a));
+        await rename(forgedNextPath, forgedKeyPath);
+        forgedResult = invokeHelper(forgedDirectory, [
+          "-RecoverRotation",
+          "-NodePath",
+          fakeNode,
+          "-MaintenanceEntryPoint",
+          "fixture",
+        ]);
+        expectSpawnCompleted(forgedResult);
+        expect(
+          forgedResult.status,
+          `${forgedResult.stdout}\n${forgedResult.stderr}`,
+        ).not.toBe(0);
+        await expect(readFile(forgedKeyPath)).resolves.toEqual(forgedNextKey);
+        await expect(readFile(forgedMarkerPath)).resolves.toEqual(
+          Buffer.alloc(32, 0x5a),
+        );
+        await expect(
+          readFile(forgedRotationPath, "utf8"),
+        ).resolves.toContain(forgedOldKeyId);
+
+        const hardLinkDirectory = path.join(root, "hard-link-marker");
+        let hardLinkResult = invokeHelper(hardLinkDirectory);
+        expectSpawnCompleted(hardLinkResult);
+        expect(
+          hardLinkResult.status,
+          `${hardLinkResult.stdout}\n${hardLinkResult.stderr}`,
+        ).toBe(0);
+        const hardLinkKeyPath = path.join(
+          hardLinkDirectory,
+          "credential-master-key",
+        );
+        const hardLinkNextPath = `${hardLinkKeyPath}.next`;
+        const hardLinkRotationPath = `${hardLinkKeyPath}.rotation`;
+        const hardLinkFixturePath = `${hardLinkKeyPath}.journal-fixture`;
+        await rename(hardLinkKeyPath, hardLinkFixturePath);
+        hardLinkResult = invokeHelper(hardLinkDirectory);
+        expectSpawnCompleted(hardLinkResult);
+        expect(
+          hardLinkResult.status,
+          `${hardLinkResult.stdout}\n${hardLinkResult.stderr}`,
+        ).toBe(0);
+        hardLinkResult = invokeHelper(hardLinkDirectory, ["-ProvisionNext"]);
+        expectSpawnCompleted(hardLinkResult);
+        expect(
+          hardLinkResult.status,
+          `${hardLinkResult.stdout}\n${hardLinkResult.stderr}`,
+        ).toBe(0);
+        const hardLinkOldKey = await readFile(hardLinkKeyPath);
+        const hardLinkNextKey = await readFile(hardLinkNextPath);
+        const hardLinkOldKeyId = createHash("sha256")
+          .update(hardLinkOldKey)
+          .digest("hex");
+        const hardLinkMarkerName =
+          `credential-master-key.retire-${hardLinkOldKeyId}`;
+        const hardLinkMarkerPath = path.join(
+          hardLinkDirectory,
+          hardLinkMarkerName,
+        );
+        await rename(hardLinkFixturePath, hardLinkRotationPath);
+        await writeFile(
+          hardLinkRotationPath,
+          `${JSON.stringify({
+            version: 2,
+            currentKeyId: hardLinkOldKeyId,
+            nextKeyId: createHash("sha256")
+              .update(hardLinkNextKey)
+              .digest("hex"),
+            retirementMarker: hardLinkMarkerName,
+            retirementKeyId: hardLinkOldKeyId,
+            retirementState: "wiping",
+          })}\n`,
+          "utf8",
+        );
+        await rm(hardLinkKeyPath);
+        await rename(hardLinkNextPath, hardLinkKeyPath);
+        await link(hardLinkKeyPath, hardLinkMarkerPath);
+        hardLinkResult = invokeHelper(hardLinkDirectory, [
+          "-RecoverRotation",
+          "-NodePath",
+          fakeNode,
+          "-MaintenanceEntryPoint",
+          "fixture",
+        ]);
+        expectSpawnCompleted(hardLinkResult);
+        expect(
+          hardLinkResult.status,
+          `${hardLinkResult.stdout}\n${hardLinkResult.stderr}`,
+        ).not.toBe(0);
+        await expect(readFile(hardLinkKeyPath)).resolves.toEqual(
+          hardLinkNextKey,
+        );
+        await expect(readFile(hardLinkMarkerPath)).resolves.toEqual(
+          hardLinkNextKey,
+        );
       } finally {
         await rm(root, { force: true, recursive: true });
       }
     },
-    60_000,
+    180_000,
   );
 
   it.skipIf(process.platform !== "win32")(

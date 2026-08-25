@@ -82,11 +82,17 @@ Offline rotation uses `dist/daemon/maintenance.js rotate-credential-key
 <dist\daemon\maintenance.js>`. The daemon must be stopped; SQLite ownership
 rejects a live owner. POSIX fsyncs the journal's parent before re-encryption and
 after every rename or removal. Windows uses `MoveFileEx` with
-`MOVEFILE_WRITE_THROUGH`, verifies each result and ACL, and retires old key
-material only after flushing zeros. A strict journal and database key ID make
-every interruption resolve to exactly the old or new key. The Windows launcher
-validates and completes a journaled crash state before enforcing the canonical
-key path, so a crash between either key rename remains restart-safe.
+`MOVEFILE_WRITE_THROUGH`, verifies each result and ACL, and first moves old key
+material intact to the exact retirement marker and key ID recorded in the
+durable journal. Only after the new canonical key is committed does it mark the
+journal as wiping, best-effort overwrite the isolated marker, delete it, and
+flush the parent directory. A torn wipe affects only that marker: the canonical
+key can start while later recovery retries cleanup. Marker paths, sizes, ACLs,
+and pre-wipe key IDs are validated to reject substituted files or reparse
+points. A strict journal and database key ID make every interruption resolve to
+exactly the old or new key. The Windows launcher validates and completes a
+journaled crash state before enforcing the canonical key path, so a crash
+between either key rename remains restart-safe.
 
 ## Installer shutdown trust
 

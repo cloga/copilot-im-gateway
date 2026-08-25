@@ -42,11 +42,22 @@ export interface LoadMasterKeyOptions {
   createRandomKey?: () => Buffer;
 }
 
-export interface RotationJournal {
+export interface LegacyRotationJournal {
   version: 1;
   currentKeyId: string;
   nextKeyId: string;
 }
+
+export interface RotationJournalV2 {
+  version: 2;
+  currentKeyId: string;
+  nextKeyId: string;
+  retirementMarker: string;
+  retirementKeyId: string;
+  retirementState: "prepared" | "wiping" | "rollback-wiping";
+}
+
+export type RotationJournal = LegacyRotationJournal | RotationJournalV2;
 
 export interface RotationDurability {
   writeJournal(rotationPath: string, journal: RotationJournal): void;
@@ -113,6 +124,16 @@ export function recoverInterruptedRotation(
   const journal = parseRotationJournal(
     readFileSync(paths.rotationPath, "utf8"),
   );
+  if (journal.version === 2) {
+    recoverVersionTwoRotation(
+      paths,
+      databasePath,
+      storage,
+      durability,
+      journal,
+    );
+    return;
+  }
   const databaseKeyId = readDatabaseCredentialKeyId(databasePath);
   const current = storage.read(paths.keyPath);
   const next = storage.read(paths.nextKeyPath);
@@ -131,6 +152,7 @@ export function recoverInterruptedRotation(
           "Credential rotation recovery found an invalid rollback state.",
         );
       }
+
       if (nextId !== undefined) {
         durability.remove(paths.nextKeyPath);
       }
@@ -182,6 +204,127 @@ export function recoverInterruptedRotation(
     current?.fill(0);
     next?.fill(0);
     previous?.fill(0);
+  }
+}
+
+function recoverVersionTwoRotation(
+  paths: MasterKeyPaths,
+  databasePath: string,
+  storage: MasterKeyStorage,
+  durability: RotationDurability,
+  journal: RotationJournalV2,
+): void {
+  const retirementPath = path.join(
+    path.dirname(paths.keyPath),
+    journal.retirementMarker,
+  );
+  const databaseKeyId = readDatabaseCredentialKeyId(databasePath);
+  const current = storage.read(paths.keyPath);
+  const next = storage.read(paths.nextKeyPath);
+  const previous = storage.read(paths.previousKeyPath);
+  const retirement = storage.read(retirementPath);
+  try {
+    const currentId = current === undefined ? undefined : keyId(current);
+    const nextId = next === undefined ? undefined : keyId(next);
+    const previousId = previous === undefined ? undefined : keyId(previous);
+    const retirementId =
+      retirement === undefined ? undefined : keyId(retirement);
+    if (previousId !== undefined) {
+      throw new Error(
+        "Credential rotation recovery found an unexpected legacy key path.",
+      );
+    }
+    if (journal.retirementState === "rollback-wiping") {
+      if (
+        databaseKeyId !== journal.currentKeyId ||
+        currentId !== journal.currentKeyId ||
+        nextId !== undefined ||
+        previousId !== undefined ||
+        (retirement !== undefined && retirement.byteLength !== keyBytes)
+      ) {
+        throw new Error(
+          "Credential rotation recovery found an invalid rollback wiping state.",
+        );
+      }
+      return;
+    }
+    if (journal.retirementState === "wiping") {
+      if (
+        databaseKeyId !== journal.nextKeyId ||
+        currentId !== journal.nextKeyId ||
+        nextId !== undefined ||
+        (retirement !== undefined && retirement.byteLength !== keyBytes)
+      ) {
+        throw new Error(
+          "Credential rotation recovery found an invalid wiping state.",
+        );
+      }
+      return;
+    }
+    if (databaseKeyId === journal.currentKeyId) {
+      if (
+        currentId !== journal.currentKeyId ||
+        retirementId !== undefined ||
+        (nextId !== undefined && nextId !== journal.nextKeyId)
+      ) {
+        throw new Error(
+          "Credential rotation recovery found an invalid rollback state.",
+        );
+      }
+      if (nextId !== undefined) {
+        durability.remove(paths.nextKeyPath);
+      }
+      durability.remove(paths.rotationPath);
+      return;
+    }
+    if (
+      databaseKeyId !== journal.nextKeyId
+    ) {
+      throw new Error(
+        "Credential rotation journal does not match the gateway database.",
+      );
+    }
+    const beforeRetirementMove =
+      currentId === journal.currentKeyId &&
+      nextId === journal.nextKeyId &&
+      retirementId === undefined;
+    const betweenRenames =
+      currentId === undefined &&
+      nextId === journal.nextKeyId &&
+      retirementId === journal.retirementKeyId;
+    const afterSwap =
+      currentId === journal.nextKeyId &&
+      nextId === undefined &&
+      retirementId === journal.retirementKeyId;
+    const afterRetirementRemoval =
+      currentId === journal.nextKeyId &&
+      nextId === undefined &&
+      retirementId === undefined;
+    if (
+      !beforeRetirementMove &&
+      !betweenRenames &&
+      !afterSwap &&
+      !afterRetirementRemoval
+    ) {
+      throw new Error(
+        "Credential rotation recovery found an invalid committed state.",
+      );
+    }
+    if (beforeRetirementMove) {
+      durability.rename(paths.keyPath, retirementPath);
+    }
+    if (beforeRetirementMove || betweenRenames) {
+      durability.rename(paths.nextKeyPath, paths.keyPath);
+    }
+    if (beforeRetirementMove || betweenRenames || afterSwap) {
+      durability.remove(retirementPath);
+    }
+    durability.remove(paths.rotationPath);
+  } finally {
+    current?.fill(0);
+    next?.fill(0);
+    previous?.fill(0);
+    retirement?.fill(0);
   }
 }
 
@@ -244,29 +387,103 @@ export function keyId(key: Uint8Array): string {
 
 export function parseRotationJournal(value: string): RotationJournal {
   const parsed: unknown = JSON.parse(value);
+  if (isLegacyRotationJournal(parsed)) {
+    return parsed;
+  }
   if (
     typeof parsed !== "object" ||
     parsed === null ||
     Array.isArray(parsed) ||
     Object.keys(parsed).sort().join(",") !==
-      "currentKeyId,nextKeyId,version" ||
+      "currentKeyId,nextKeyId,retirementKeyId,retirementMarker,retirementState,version" ||
     !("version" in parsed) ||
-    parsed.version !== 1 ||
+    parsed.version !== 2 ||
     !("currentKeyId" in parsed) ||
     typeof parsed.currentKeyId !== "string" ||
     !/^[a-f0-9]{64}$/u.test(parsed.currentKeyId) ||
     !("nextKeyId" in parsed) ||
     typeof parsed.nextKeyId !== "string" ||
     !/^[a-f0-9]{64}$/u.test(parsed.nextKeyId) ||
-    parsed.currentKeyId === parsed.nextKeyId
+    parsed.currentKeyId === parsed.nextKeyId ||
+    !("retirementKeyId" in parsed) ||
+    typeof parsed.retirementKeyId !== "string" ||
+    !("retirementMarker" in parsed) ||
+    typeof parsed.retirementMarker !== "string" ||
+    !("retirementState" in parsed) ||
+    (parsed.retirementState !== "prepared" &&
+      parsed.retirementState !== "wiping" &&
+      parsed.retirementState !== "rollback-wiping") ||
+    !validRetirementBinding(
+      parsed.currentKeyId,
+      parsed.nextKeyId,
+      parsed.retirementKeyId,
+      parsed.retirementMarker,
+      parsed.retirementState,
+    )
   ) {
     throw new Error("Credential rotation journal is invalid.");
   }
   return {
-    version: 1,
+    version: 2,
     currentKeyId: parsed.currentKeyId,
     nextKeyId: parsed.nextKeyId,
+    retirementMarker: parsed.retirementMarker,
+    retirementKeyId: parsed.retirementKeyId,
+    retirementState: parsed.retirementState,
   };
+}
+
+function isLegacyRotationJournal(
+  value: unknown,
+): value is LegacyRotationJournal {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.keys(value).sort().join(",") ===
+      "currentKeyId,nextKeyId,version" &&
+    "version" in value &&
+    value.version === 1 &&
+    "currentKeyId" in value &&
+    typeof value.currentKeyId === "string" &&
+    /^[a-f0-9]{64}$/u.test(value.currentKeyId) &&
+    "nextKeyId" in value &&
+    typeof value.nextKeyId === "string" &&
+    /^[a-f0-9]{64}$/u.test(value.nextKeyId) &&
+    value.currentKeyId !== value.nextKeyId
+  );
+}
+
+export function rotationRetirementMarker(currentKeyId: string): string {
+  if (!/^[a-f0-9]{64}$/u.test(currentKeyId)) {
+    throw new Error("Credential rotation key identity is invalid.");
+  }
+  return `credential-master-key.retire-${currentKeyId}`;
+}
+
+function validRetirementBinding(
+  currentKeyId: string,
+  nextKeyId: string,
+  retirementKeyId: unknown,
+  retirementMarker: unknown,
+  retirementState: "prepared" | "wiping" | "rollback-wiping",
+): boolean {
+  if (
+    typeof retirementKeyId !== "string" ||
+    typeof retirementMarker !== "string"
+  ) {
+    return false;
+  }
+  if (retirementState === "rollback-wiping") {
+    return (
+      retirementKeyId === nextKeyId &&
+      retirementMarker === `credential-master-key.abort-${nextKeyId}`
+    );
+  }
+  return (
+    retirementKeyId === currentKeyId &&
+    retirementMarker === rotationRetirementMarker(currentKeyId)
+  );
 }
 
 export class FileRotationDurability implements RotationDurability {

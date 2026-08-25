@@ -25,6 +25,7 @@ import {
   parseRotationJournal,
   recoverInterruptedRotation,
   resolveMasterKeyPaths,
+  rotationRetirementMarker,
   writeRotationJournal,
   type MasterKeyStorage,
   type RotationDurability,
@@ -431,6 +432,7 @@ describe("credential state protection", () => {
 
   it("rejects malicious or incomplete rotation journals without changing keys", () => {
     const oldKey = Buffer.alloc(32, 20);
+    const oldKeyId = keyId(oldKey);
     for (const journal of [
       '{"version":1,"currentKeyId":"invalid"}\n',
       `${JSON.stringify({
@@ -439,11 +441,34 @@ describe("credential state protection", () => {
         nextKeyId: "a".repeat(64),
         keyPath: "C:\\attacker-controlled",
       })}\n`,
+      `${JSON.stringify({
+        version: 2,
+        currentKeyId: oldKeyId,
+        nextKeyId: "a".repeat(64),
+        retirementMarker: "credential-master-key.retire-attacker",
+        retirementKeyId: oldKeyId,
+        retirementState: "prepared",
+      })}\n`,
     ]) {
       expect(() => parseRotationJournal(journal)).toThrow(
         "rotation journal is invalid",
       );
     }
+    expect(
+      parseRotationJournal(
+        `${JSON.stringify({
+          version: 2,
+          currentKeyId: oldKeyId,
+          nextKeyId: "a".repeat(64),
+          retirementMarker: rotationRetirementMarker(oldKeyId),
+          retirementKeyId: oldKeyId,
+          retirementState: "wiping",
+        })}\n`,
+      ),
+    ).toMatchObject({
+      version: 2,
+      retirementState: "wiping",
+    });
   });
 
   it("rotates the durable key through the offline maintenance operation", () => {
@@ -574,6 +599,53 @@ describe("credential state protection", () => {
     expect(readFileSync(paths.keyPath)).toEqual(newKey);
     const recovered = new GatewayStore(databasePath, { secretKey: newKey });
     recovered.close();
+  });
+
+  it("allows the committed key to start while marker wipe cleanup is pending", () => {
+    const directory = temporaryDirectory();
+    const databasePath = path.join(directory, "gateway.sqlite");
+    const paths = resolveMasterKeyPaths(directory);
+    const oldKey = Buffer.alloc(32, 23);
+    const newKey = Buffer.alloc(32, 24);
+    const oldKeyId = keyId(oldKey);
+    const markerPath = path.join(
+      directory,
+      rotationRetirementMarker(oldKeyId),
+    );
+    writeFileSync(paths.keyPath, oldKey);
+    const store = new GatewayStore(databasePath, { secretKey: oldKey });
+    store.setChannelState(
+      identity,
+      "credentials",
+      { botToken: "fixture-secret-token" },
+      "2026-08-25T00:00:00.000Z",
+    );
+    store.rotateSecrets(new AesGcmSecretCipher(newKey));
+    store.close();
+    writeFileSync(paths.keyPath, newKey);
+    writeFileSync(markerPath, Buffer.concat([
+      Buffer.alloc(7),
+      oldKey.subarray(7),
+    ]));
+    writeRotationJournal(paths.rotationPath, {
+      version: 2,
+      currentKeyId: oldKeyId,
+      nextKeyId: keyId(newKey),
+      retirementMarker: path.basename(markerPath),
+      retirementKeyId: oldKeyId,
+      retirementState: "wiping",
+    });
+
+    const loaded = loadOrCreateMasterKey({
+      keyPath: paths.keyPath,
+      databasePath,
+      platform: "win32",
+      environment: { NODE_ENV: "test" },
+    });
+    expect(loaded).toEqual(newKey);
+    expect(existsSync(markerPath)).toBe(true);
+    expect(existsSync(paths.rotationPath)).toBe(true);
+    loaded.fill(0);
   });
 
   it.each([1, 2, 3, 4])(

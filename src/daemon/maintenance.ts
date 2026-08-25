@@ -13,6 +13,7 @@ import {
   readDatabaseCredentialKeyId,
   recoverInterruptedRotation,
   resolveMasterKeyPaths,
+  rotationRetirementMarker,
   validateKey,
   type MasterKeyStorage,
   type RotationDurability,
@@ -65,9 +66,12 @@ export function rotateCredentialMasterKey(
   }
   validateKey(nextKey);
   const journal = {
-    version: 1 as const,
+    version: 2 as const,
     currentKeyId: keyId(currentKey),
     nextKeyId: keyId(nextKey),
+    retirementMarker: rotationRetirementMarker(keyId(currentKey)),
+    retirementKeyId: keyId(currentKey),
+    retirementState: "prepared" as const,
   };
   let store: GatewayStore | undefined;
   try {
@@ -78,9 +82,13 @@ export function rotateCredentialMasterKey(
     const rotated = store.rotateSecrets(new AesGcmSecretCipher(nextKey));
     store.close();
     store = undefined;
-    durability.rename(paths.keyPath, paths.previousKeyPath);
+    const retirementPath = path.join(
+      path.dirname(paths.keyPath),
+      journal.retirementMarker,
+    );
+    durability.rename(paths.keyPath, retirementPath);
     durability.rename(paths.nextKeyPath, paths.keyPath);
-    durability.remove(paths.previousKeyPath);
+    durability.remove(retirementPath);
     durability.remove(paths.rotationPath);
     return rotated;
   } finally {
