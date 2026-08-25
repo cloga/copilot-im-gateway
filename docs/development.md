@@ -21,8 +21,8 @@ The daemon reports its loopback URL and token file path, never the token value.
 The installed daemon and extension are a compatibility unit: `/v2/status`
 advertises the required API capabilities, and the extension refuses unsafe work
 with `DAEMON_UPGRADE_REQUIRED` when they are missing. Release validation includes
-both the compiled daemon entrypoint and every extension runtime file in the same
-archive.
+the complete transitive compiled daemon ESM closure and every extension runtime
+file in the same archive.
 
 ## Extension
 

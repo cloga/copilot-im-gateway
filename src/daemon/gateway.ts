@@ -47,21 +47,46 @@ export class GatewayService implements ChannelContext {
   }
 
   async startChannels(): Promise<void> {
-    await Promise.all(
-      [...this.#adapters.values()].map(async (adapter) => {
-        await adapter.start(this);
-        this.#health.set(adapter.id, adapter.getHealth());
-      }),
+    await this.#settleChannelLifecycle(
+      (adapter) => adapter.start(this),
+      "Gateway channel startup failed.",
     );
   }
 
   async stopChannels(): Promise<void> {
-    await Promise.all(
-      [...this.#adapters.values()].map(async (adapter) => {
-        await adapter.stop();
-        this.#health.set(adapter.id, adapter.getHealth());
-      }),
+    await this.#settleChannelLifecycle(
+      (adapter) => adapter.stop(),
+      "Gateway channel shutdown failed.",
     );
+  }
+
+  async #settleChannelLifecycle(
+    operation: (adapter: ImChannelAdapter) => Promise<void>,
+    failureMessage: string,
+  ): Promise<void> {
+    const adapters = [...this.#adapters.values()];
+    const results = await Promise.allSettled(
+      adapters.map((adapter) => Promise.resolve().then(() => operation(adapter))),
+    );
+    const failures: unknown[] = [];
+    for (const result of results) {
+      if (result.status === "rejected") {
+        failures.push(result.reason);
+      }
+    }
+    for (const adapter of adapters) {
+      try {
+        this.#health.set(adapter.id, adapter.getHealth());
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    if (failures.length === 1 && failures[0] instanceof Error) {
+      throw failures[0];
+    }
+    if (failures.length > 0) {
+      throw new AggregateError(failures, failureMessage);
+    }
   }
 
   getChannel(id: string): ImChannelAdapter {

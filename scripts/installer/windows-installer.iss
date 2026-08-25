@@ -39,6 +39,7 @@ Source: "{#StageDir}\runtime\*"; DestDir: "{app}\runtime"; Flags: ignoreversion 
 Source: "{#StageDir}\extension\*"; DestDir: "{code:GetExtensionDir}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#StageDir}\start-daemon.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\open-status.cmd"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\stop-daemon.ps1"; Flags: dontcopy
 
 [Icons]
 Name: "{userprograms}\Copilot IM Gateway\Start Copilot IM Gateway"; Filename: "{app}\start-daemon.cmd"; WorkingDir: "{app}\app"
@@ -56,4 +57,64 @@ begin
     Result := CustomDirectory
   else
     Result := ExpandConstant('{%USERPROFILE}\.copilot\extensions\im-gateway');
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+  PowerShellPath: String;
+  StopScriptPath: String;
+  Arguments: String;
+  DataDirectory: String;
+  TokenFile: String;
+  PortText: String;
+  GatewayPort: Integer;
+begin
+  Result := '';
+  try
+    ExtractTemporaryFile('stop-daemon.ps1');
+  except
+    Result := 'Unable to prepare the daemon upgrade guard.';
+    exit;
+  end;
+
+  PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  StopScriptPath := ExpandConstant('{tmp}\stop-daemon.ps1');
+  Arguments :=
+    '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
+    StopScriptPath + '" -InstallDirectory "' + ExpandConstant('{app}') + '"';
+  DataDirectory := ExpandConstant('{param:GATEWAYDATADIR|}');
+  TokenFile := ExpandConstant('{param:GATEWAYTOKENFILE|}');
+  PortText := ExpandConstant('{param:GATEWAYPORT|}');
+  if (Pos('"', DataDirectory) > 0) or (Pos('"', TokenFile) > 0) then
+  begin
+    Result := 'Gateway data and token paths cannot contain quotation marks.';
+    exit;
+  end;
+  if DataDirectory <> '' then
+    Arguments := Arguments + ' -DataDirectory "' + DataDirectory + '"';
+  if TokenFile <> '' then
+    Arguments := Arguments + ' -TokenFile "' + TokenFile + '"';
+  if PortText <> '' then
+  begin
+    if (not TryStrToInt(PortText, GatewayPort)) or
+       (GatewayPort < 0) or (GatewayPort > 65535) then
+    begin
+      Result := 'Gateway port must be an integer from 0 to 65535.';
+      exit;
+    end;
+    Arguments := Arguments + ' -Port ' + IntToStr(GatewayPort);
+  end;
+  if not Exec(
+    PowerShellPath,
+    Arguments,
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  ) then
+    Result := 'Unable to run the daemon upgrade guard.'
+  else if ResultCode <> 0 then
+    Result :=
+      'The existing gateway daemon did not stop or release its loopback port.';
 end;

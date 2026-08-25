@@ -37,9 +37,13 @@ export const gatewayCapabilities = [
   "reservation-ownership",
 ] as const;
 
-export interface GatewayHttpServerOptions {
+export interface GatewayHttpHandlerOptions {
   service: GatewayService;
   bearerToken: string;
+  onShutdown?: () => Promise<void> | void;
+}
+
+export interface GatewayHttpServerOptions extends GatewayHttpHandlerOptions {
   port: number;
 }
 
@@ -47,6 +51,10 @@ export interface RunningGatewayServer {
   server: Server;
   url: string;
   close(): Promise<void>;
+}
+
+export interface ReservedGatewayHttpServer extends RunningGatewayServer {
+  activate(options: GatewayHttpHandlerOptions): RunningGatewayServer;
 }
 
 function isLoopbackOrigin(origin: string): boolean {
@@ -118,6 +126,29 @@ async function readJson<T>(
   return schema.parse(parsed);
 }
 
+async function requireEmptyBody(request: IncomingMessage): Promise<void> {
+  let size = 0;
+  for await (const chunk of request) {
+    size += Buffer.isBuffer(chunk)
+      ? chunk.length
+      : Buffer.byteLength(chunk);
+    if (size > maxBodyBytes) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.invalidInput,
+        message: "Request body exceeds the 1 MiB limit.",
+        status: 413,
+      });
+    }
+  }
+  if (size !== 0) {
+    throw new GatewayError({
+      code: gatewayErrorCodes.invalidInput,
+      message: "This endpoint does not accept a request body.",
+      status: 400,
+    });
+  }
+}
+
 function authenticate(
   request: IncomingMessage,
   expectedToken: string,
@@ -153,15 +184,38 @@ function isUnsafeLegacyV1Operation(method: string, pathname: string): boolean {
   );
 }
 
-export async function startGatewayHttpServer(
-  options: GatewayHttpServerOptions,
-): Promise<RunningGatewayServer> {
+export async function reserveGatewayHttpServer(
+  port: number,
+): Promise<ReservedGatewayHttpServer> {
+  let handlerOptions: GatewayHttpHandlerOptions | undefined;
+  let activated = false;
+  let closed = false;
   const server = createServer((request, response) => {
+    const options = handlerOptions;
+    if (options === undefined) {
+      const requestId = randomUUID();
+      response.setHeader("X-Request-Id", requestId);
+      setCorsHeaders(request, response);
+      sendJson(
+        response,
+        503,
+        toErrorEnvelope(
+          new GatewayError({
+            code: gatewayErrorCodes.internal,
+            message: "The gateway is still starting.",
+            status: 503,
+            retryable: true,
+          }),
+          requestId,
+        ),
+      );
+      return;
+    }
     void handleRequest(options, request, response);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(options.port, "127.0.0.1", () => {
+    server.listen(port, "127.0.0.1", () => {
       server.off("error", reject);
       resolve();
     });
@@ -170,24 +224,81 @@ export async function startGatewayHttpServer(
   if (address === null || typeof address === "string") {
     throw new Error("Gateway server did not expose a TCP address.");
   }
-  return {
+  const close = async (): Promise<void> => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    if (!server.listening) {
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => {
+        if (error === undefined) {
+          resolve();
+        } else {
+          reject(error);
+        }
+      });
+    });
+  };
+  const running: RunningGatewayServer = {
     server,
     url: `http://127.0.0.1:${address.port}`,
-    close: () =>
-      new Promise<void>((resolve, reject) => {
-        server.close((error) => {
-          if (error === undefined) {
-            resolve();
-          } else {
-            reject(error);
-          }
-        });
-      }),
+    close,
+  };
+  return {
+    ...running,
+    activate(options): RunningGatewayServer {
+      if (closed) {
+        throw new Error("Gateway HTTP reservation is already closed.");
+      }
+      if (activated) {
+        throw new Error("Gateway HTTP reservation is already active.");
+      }
+      const onShutdown = options.onShutdown;
+      let shutdownScheduled = false;
+      handlerOptions = {
+        service: options.service,
+        bearerToken: options.bearerToken,
+        ...(onShutdown === undefined
+          ? {}
+          : {
+              onShutdown: () => {
+                if (shutdownScheduled) {
+                  return;
+                }
+                shutdownScheduled = true;
+                setImmediate(() => {
+                  void Promise.resolve()
+                    .then(onShutdown)
+                    .catch((error: unknown) => {
+                      console.error("Gateway shutdown callback failed.", error);
+                    });
+                });
+              },
+            }),
+      };
+      activated = true;
+      return running;
+    },
   };
 }
 
-async function handleRequest(
+export async function startGatewayHttpServer(
   options: GatewayHttpServerOptions,
+): Promise<RunningGatewayServer> {
+  const reservation = await reserveGatewayHttpServer(options.port);
+  try {
+    return reservation.activate(options);
+  } catch (error) {
+    await reservation.close();
+    throw error;
+  }
+}
+
+async function handleRequest(
+  options: GatewayHttpHandlerOptions,
   request: IncomingMessage,
   response: ServerResponse,
 ): Promise<void> {
@@ -221,6 +332,19 @@ async function handleRequest(
 
     authenticate(request, options.bearerToken);
 
+    if (method === "POST" && pathname === "/v2/admin/shutdown") {
+      if (options.onShutdown === undefined) {
+        throw new GatewayError({
+          code: gatewayErrorCodes.internal,
+          message: "Gateway shutdown is not available.",
+          status: 503,
+        });
+      }
+      await requireEmptyBody(request);
+      sendJson(response, 202, { accepted: true });
+      void options.onShutdown();
+      return;
+    }
     if (method === "GET" && pathname === "/v1/status") {
       sendJson(response, 200, options.service.getStatus());
       return;

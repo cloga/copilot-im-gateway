@@ -1,3 +1,9 @@
+param(
+    [string]$DataDirectory,
+    [string]$TokenFile,
+    [int]$Port = -1
+)
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
@@ -43,6 +49,18 @@ try {
     finally {
         Pop-Location
     }
+
+    $stopParameters = @{ InstallDirectory = $installDirectory }
+    if ($PSBoundParameters.ContainsKey("DataDirectory")) {
+        $stopParameters.DataDirectory = $DataDirectory
+    }
+    if ($PSBoundParameters.ContainsKey("TokenFile")) {
+        $stopParameters.TokenFile = $TokenFile
+    }
+    if ($PSBoundParameters.ContainsKey("Port")) {
+        $stopParameters.Port = $Port
+    }
+    & (Join-Path $PSScriptRoot "stop-daemon.ps1") @stopParameters
 
     if (Test-Path -LiteralPath $installDirectory) {
         Remove-Item -LiteralPath $installDirectory -Recurse -Force

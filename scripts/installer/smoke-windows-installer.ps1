@@ -49,6 +49,7 @@ try {
 
     foreach ($expectedFile in @(
         "runtime\node.exe",
+        "app\daemon-runtime-closure.json",
         "app\dist\daemon\main.js",
         "app\node_modules\zod\package.json",
         "start-daemon.cmd",
@@ -63,22 +64,19 @@ try {
             throw "Installed extension file is missing: $extensionFile"
         }
     }
-    $pendingImports = [Collections.Generic.Queue[string]]::new()
-    $visitedModules = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    $pendingImports.Enqueue((Join-Path $extensionDirectory "extension.mjs"))
-    while ($pendingImports.Count -gt 0) {
-        $modulePath = $pendingImports.Dequeue()
-        if (-not $visitedModules.Add($modulePath)) {
-            continue
-        }
-        $moduleSource = Get-Content -LiteralPath $modulePath -Raw
-        foreach ($match in [regex]::Matches($moduleSource, '(?m)^\s*(?:import|export)\s+(?:[^''"]+\s+from\s+)?[''"](?<specifier>\./[^''"]+)[''"]')) {
-            $dependencyPath = [IO.Path]::GetFullPath((Join-Path (Split-Path $modulePath) $match.Groups["specifier"].Value))
-            if (-not (Test-Path -LiteralPath $dependencyPath -PathType Leaf)) {
-                throw "Installed extension import is missing: $($match.Groups["specifier"].Value)"
-            }
-            $pendingImports.Enqueue($dependencyPath)
-        }
+    $installedNode = Join-Path $installDirectory "runtime\node.exe"
+    $closureHelper = Join-Path $repositoryRoot "scripts\release\esm-closure.mjs"
+    & $installedNode `
+        $closureHelper `
+        verify `
+        (Join-Path $installDirectory "app") `
+        (Join-Path $installDirectory "app\daemon-runtime-closure.json")
+    if ($LASTEXITCODE -ne 0) {
+        throw "Installed daemon runtime closure validation failed."
+    }
+    & $installedNode $closureHelper check $extensionDirectory "extension.mjs"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Installed extension runtime closure validation failed."
     }
 
     $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
@@ -105,6 +103,38 @@ try {
             throw
         }
     }
+
+    $upgrade = Start-Process -FilePath $resolvedInstallerPath -ArgumentList @(
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/DIR=$installDirectory",
+        "/EXTENSIONDIR=$extensionDirectory",
+        "/GATEWAYDATADIR=$dataDirectory",
+        "/GATEWAYPORT=$port"
+    ) -Wait -PassThru
+    if ($upgrade.ExitCode -ne 0) {
+        throw "Silent upgrade failed with exit code $($upgrade.ExitCode)."
+    }
+    if (-not $daemon.WaitForExit(30000)) {
+        throw "Upgrade did not terminate the old daemon process."
+    }
+    if ($daemon.ExitCode -ne 0) {
+        throw "Upgrade did not gracefully shut down the old daemon process."
+    }
+    $portProbe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $port)
+    try {
+        $portProbe.Start()
+    }
+    catch {
+        throw "Upgrade did not wait for loopback port release."
+    }
+    finally {
+        $portProbe.Stop()
+    }
+
+    $daemon = [Diagnostics.Process]::Start($startInfo)
+    Wait-ForHealth -Port $port
 }
 finally {
     if ($null -ne $daemon -and -not $daemon.HasExited) {

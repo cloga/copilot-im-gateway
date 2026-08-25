@@ -73,6 +73,11 @@ their audit records. Durable sequence numbers prevent retrying work from being
 overtaken after restart. Terminal inbox metadata and audit data default to
 14-day and 30-day retention respectively.
 
+Startup first binds the configured port on `127.0.0.1`. The same HTTP server
+holds that listener while SQLite is opened and migrated, returns `503` until
+channels are ready, and then receives the real request handler. A bind failure
+therefore leaves even a legacy database untouched.
+
 Admission reservations carry the owning daemon generation. A replacement daemon
 rechecks sender, personal binding, durable rate, and capacity policy before it
 reclaims the original sequence. A duplicate still being materialized by the
@@ -108,9 +113,16 @@ account or sender fail with HTTP 426 and `UPGRADE_REQUIRED`; they are never
 silently interpreted as v2. A new extension maps a missing or incomplete v2
 handshake to `DAEMON_UPGRADE_REQUIRED` before sending an unsafe request.
 
-Release archives and the Windows installer carry the compiled daemon and the
-complete extension directory in one validated package. Upgrade those artifacts
-together rather than copying an extension or daemon independently.
+Release archives and the Windows installer carry the compiled daemon, its
+validated recursive ESM closure manifest, and the complete extension directory
+in one package. Installer upgrades send an authenticated, empty-body
+`POST /v2/admin/shutdown`; the daemon acknowledges before asynchronously closing
+the listener, settling every channel stop, and releasing SQLite ownership.
+Upgrades wait for the exact process and loopback port to exit. A verified legacy
+Node daemon without that endpoint may be force-stopped only after command-line
+revalidation, followed by the full ownership-lease expiry delay. Startup binding
+remains the final fail-closed migration guard. Upgrade those artifacts together
+rather than copying an extension or daemon independently.
 
 ## Governance invariants
 

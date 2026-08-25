@@ -51,7 +51,9 @@ afterEach(async () => {
   }
 });
 
-async function createHarness(): Promise<{
+async function createHarness(
+  onShutdown?: () => Promise<void> | void,
+): Promise<{
   baseUrl: string;
   token: string;
   channel: MockChannel;
@@ -68,6 +70,7 @@ async function createHarness(): Promise<{
     service,
     bearerToken: token,
     port: 0,
+    ...(onShutdown === undefined ? {} : { onShutdown }),
   });
   cleanups.push(async () => {
     await closeHarness(running, service, store);
@@ -103,6 +106,58 @@ async function request(
 }
 
 describe("gateway HTTP API", () => {
+  it("authenticates and schedules administrative shutdown exactly once", async () => {
+    let callbackCalls = 0;
+    let observeShutdown: () => void = () => undefined;
+    const shutdownObserved = new Promise<void>((resolve) => {
+      observeShutdown = resolve;
+    });
+    const harness = await createHarness(() => {
+      callbackCalls += 1;
+      observeShutdown();
+    });
+
+    const unauthenticated = await request(
+      harness.baseUrl,
+      undefined,
+      "/v2/admin/shutdown",
+      { method: "POST" },
+    );
+    expect(unauthenticated.status).toBe(401);
+    expect(callbackCalls).toBe(0);
+
+    const bodyRejected = await request(
+      harness.baseUrl,
+      harness.token,
+      "/v2/admin/shutdown",
+      { method: "POST", body: "{}" },
+    );
+    expect(bodyRejected.status).toBe(400);
+    expect(callbackCalls).toBe(0);
+
+    const accepted = await request(
+      harness.baseUrl,
+      harness.token,
+      "/v2/admin/shutdown",
+      { method: "POST" },
+    );
+    expect(accepted.status).toBe(202);
+    expect(await accepted.json()).toEqual({ accepted: true });
+    await shutdownObserved;
+
+    const repeated = await request(
+      harness.baseUrl,
+      harness.token,
+      "/v2/admin/shutdown",
+      { method: "POST" },
+    );
+    expect(repeated.status).toBe(202);
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+    expect(callbackCalls).toBe(1);
+  });
+
   it("requires authentication and enforces personal workspace bindings", async () => {
     const harness = await createHarness();
     expect((await fetch(`${harness.baseUrl}/healthz`)).status).toBe(200);

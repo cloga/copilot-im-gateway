@@ -46,7 +46,9 @@ TypeScript.
 3. Run the installer. It installs per-user under
    `%LOCALAPPDATA%\Programs\Copilot IM Gateway`, registers the extension under
    `%USERPROFILE%\.copilot\extensions\im-gateway`, and creates Start Menu
-   shortcuts. Reload extensions in GitHub Copilot App after installation.
+   shortcuts. During an upgrade it uses the local bearer token to request
+   graceful daemon shutdown and waits for the exact process and loopback port
+   to be released. Reload extensions in GitHub Copilot App after installation.
 4. Open **Start Copilot IM Gateway** from the Start Menu. The installer does not
    configure persistent auto-start.
 5. Use **Gateway status** to open the unauthenticated local health endpoint.
@@ -77,7 +79,9 @@ The release contains compiled JavaScript, so consumers do not need TypeScript,
 development dependencies, or a local build. The installer runs
 `npm ci --omit=dev --ignore-scripts`, installs under
 `$HOME\.copilot\im-gateway`, and copies only the versioned extension files to
-`$HOME\.copilot\extensions\im-gateway`. It does not read or write credentials.
+`$HOME\.copilot\extensions\im-gateway`. It stops an installed daemon before
+replacement by reading its local bearer-token file without displaying or
+copying the credential.
 
 The first daemon start creates a local bearer token in the data directory with
 owner-only permissions where supported. Inspect the startup message for the

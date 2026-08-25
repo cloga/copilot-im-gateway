@@ -13,6 +13,12 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  collectFilesystemEsmClosure,
+  daemonRuntimeEntrypoint,
+  daemonRuntimeManifest,
+  writeEsmClosureManifest,
+} from "./release/esm-closure.mjs";
 
 const repositoryRoot = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
@@ -29,6 +35,7 @@ const releaseInputs = [
   "package.json",
   "scripts/release/install.ps1",
   "scripts/release/start.ps1",
+  "scripts/release/stop-daemon.ps1",
 ];
 
 const crc32Table = Array.from({ length: 256 }, (_, value) => {
@@ -45,8 +52,11 @@ const crc32Table = Array.from({ length: 256 }, (_, value) => {
  * @param {string} root
  */
 export async function assertBuildOutput(root) {
-  const entrypoint = path.join(root, "dist", "daemon", "main.js");
   try {
+    const entrypoint = path.join(
+      root,
+      ...daemonRuntimeEntrypoint.split("/"),
+    );
     if (!(await stat(entrypoint)).isFile()) {
       throw new Error("not a file");
     }
@@ -55,6 +65,7 @@ export async function assertBuildOutput(root) {
       "Release build output is missing: dist/daemon/main.js. Run npm run build first.",
     );
   }
+  return collectFilesystemEsmClosure(root, daemonRuntimeEntrypoint);
 }
 
 /**
@@ -100,7 +111,15 @@ async function prepareStage(root, stage) {
     path.join(stage, "scripts", "release", "start.ps1"),
     path.join(stage, "start.ps1"),
   );
+  await rename(
+    path.join(stage, "scripts", "release", "stop-daemon.ps1"),
+    path.join(stage, "stop-daemon.ps1"),
+  );
   await rm(path.join(stage, "scripts"), { recursive: true });
+  await writeEsmClosureManifest(
+    stage,
+    path.join(stage, daemonRuntimeManifest),
+  );
 }
 
 /**

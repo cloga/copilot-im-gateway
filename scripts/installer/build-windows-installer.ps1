@@ -54,7 +54,14 @@ try {
     foreach ($entry in @("package.json", "package-lock.json", "README.md", "THIRD_PARTY_NOTICES.md")) {
         Copy-Item -LiteralPath (Join-Path $repositoryRoot $entry) -Destination $applicationDirectory -Force
     }
+    $closureHelper = Join-Path $repositoryRoot "scripts\release\esm-closure.mjs"
+    $closureManifest = Join-Path $applicationDirectory "daemon-runtime-closure.json"
+    & node $closureHelper write $applicationDirectory $closureManifest
+    if ($LASTEXITCODE -ne 0) {
+        throw "Daemon runtime closure generation failed with exit code $LASTEXITCODE."
+    }
     Copy-Item -Path (Join-Path $repositoryRoot ".github\extensions\im-gateway\*") -Destination $extensionDirectory -Recurse -Force
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot "scripts\release\stop-daemon.ps1") -Destination $stageDirectory
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "start-daemon.cmd") -Destination $stageDirectory
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot "open-status.cmd") -Destination $stageDirectory
 
