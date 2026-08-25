@@ -4,6 +4,23 @@ import { createCanvas } from "@github/copilot-sdk/extension";
 
 const servers = new Map();
 
+/**
+ * @param {{value:string, dataset:Record<string, string | undefined>}} input
+ * @param {string | undefined} value
+ */
+export function setAutoFilledValue(input, value) {
+  if (!value) {
+    return;
+  }
+  const previous = input.dataset.autoFilled;
+  if (input.value.length === 0 || input.value === previous) {
+    input.value = value;
+    input.dataset.autoFilled = value;
+  } else if (previous !== undefined) {
+    delete input.dataset.autoFilled;
+  }
+}
+
 /** @param {string} actual @param {string} expected */
 function safeEqual(actual, expected) {
   const actualBuffer = Buffer.from(actual);
@@ -62,8 +79,8 @@ function renderHtml() {
       <h2>Policy</h2>
       <div class="grid">
         <form id="alias-form"><strong>Workspace alias</strong><input name="alias" placeholder="personal-repo" required /><input name="path" placeholder="C:\\path\\to\\repo" required /><button>Save personal alias</button></form>
-        <form id="sender-form"><strong>Allowed sender</strong><input name="channelId" value="weixin-main" required /><input name="senderId" placeholder="WeChat user ID" required /><button>Allow sender</button></form>
-        <form id="binding-form"><strong>Session binding</strong><input name="channelId" value="weixin-main" required /><input name="conversationId" placeholder="WeChat conversation/user ID" required /><input name="workspaceAlias" placeholder="personal-repo" required /><button>Bind current session</button></form>
+        <form id="sender-form"><strong>Allowed sender</strong><input name="tenantId" value="local" required /><input name="channelId" value="weixin-main" required /><input name="accountId" placeholder="Negotiated bot account ID" required /><input name="senderId" placeholder="WeChat user ID" required /><button>Allow sender</button></form>
+        <form id="binding-form"><strong>Session binding</strong><input name="tenantId" value="local" required /><input name="channelId" value="weixin-main" required /><input name="accountId" placeholder="Negotiated bot account ID" required /><input name="conversationId" placeholder="WeChat conversation/user ID" required /><input name="senderId" placeholder="Conversation owner ID" required /><input name="workspaceAlias" placeholder="personal-repo" required /><button>Bind current session</button></form>
       </div>
     </section>
     <section><h2>Pending approvals</h2><div id="approvals"></div></section>
@@ -94,13 +111,36 @@ function renderHtml() {
       } catch { return ""; }
     }
     function values(form) { return Object.fromEntries(new FormData(form).entries()); }
+    ${setAutoFilledValue.toString()}
+    function setAutoFilled(selector, value) {
+      const input = document.querySelector(selector);
+      if (input) setAutoFilledValue(input, value);
+    }
+    function prefillLoginIdentity(login) {
+      if (!login) return;
+      setAutoFilled("#sender-form [name=accountId]", login.accountId);
+      setAutoFilled("#binding-form [name=accountId]", login.accountId);
+      setAutoFilled("#sender-form [name=senderId]", login.userId);
+      setAutoFilled("#binding-form [name=senderId]", login.userId);
+      setAutoFilled("#binding-form [name=conversationId]", login.userId);
+    }
     async function refresh() {
       notice.textContent = "";
       try {
         const [status, audit] = await Promise.all([api("/api/status"), api("/api/audit")]);
-        document.querySelector("#channels").innerHTML = status.channels.map(channel =>
-          '<div><span class="badge">' + esc(channel.id) + '</span><p>' + esc(channel.health.state) + '</p></div>'
-        ).join("");
+        document.querySelector("#channels").innerHTML = status.channels.map(channel => {
+          const identity = channel.login
+            ? '<div class="muted">Account: ' + esc(channel.login.accountId) +
+              (channel.login.userId ? '<br>User: ' + esc(channel.login.userId) : '') + '</div>'
+            : '';
+          const label = channel.health.accountLabel
+            ? '<div class="muted">Ready as: ' + esc(channel.health.accountLabel) + '</div>'
+            : '';
+          return '<div><span class="badge">' + esc(channel.id) + '</span><p>' +
+            esc(channel.health.state) + '</p>' + label + identity + '</div>';
+        }).join("");
+        const currentLogin = status.channels.find(channel => channel.login)?.login;
+        prefillLoginIdentity(currentLogin);
         document.querySelector("#configuration").textContent = JSON.stringify({
           workspaceAliases: status.workspaceAliases,
           allowedSenders: status.allowedSenders,
@@ -128,6 +168,7 @@ function renderHtml() {
       document.querySelector("#qr").innerHTML = qrUrl
         ? '<p>' + esc(result.state) + '</p><img alt="WeChat login QR" src="' + qrUrl + '" />'
         : '<p>' + esc(result.state) + '</p>';
+      prefillLoginIdentity(result);
       await refresh();
     };
     document.querySelector("#verify-form").onsubmit = async event => {
@@ -136,6 +177,7 @@ function renderHtml() {
       const qrUrl = result.qrCodeUrl ? safeImageUrl(result.qrCodeUrl) : "";
       document.querySelector("#qr").innerHTML = '<p>' + esc(result.state) + '</p>' +
         (qrUrl ? '<img alt="WeChat login QR" src="' + qrUrl + '" />' : "");
+      prefillLoginIdentity(result);
       await refresh();
     };
     document.querySelector("#alias-form").onsubmit = async event => { event.preventDefault(); await post("/api/aliases", values(event.currentTarget)); };
@@ -246,39 +288,25 @@ async function handleCanvasRequest(options, secret, request, response) {
       return;
     }
     if (method === "GET" && url.pathname === "/api/audit") {
-      sendJson(response, 200, await options.client.request("/v1/audit?limit=100"));
+      sendJson(response, 200, await options.client.audit());
       return;
     }
     const body = method === "POST" ? await readBody(request) : {};
     if (method === "POST" && url.pathname === "/api/login/start") {
-      sendJson(
-        response,
-        200,
-        await options.client.request("/v1/channels/weixin-main/login/start", {
-          method: "POST",
-          body: "{}",
-        }),
-      );
+      sendJson(response, 200, await options.client.startLogin());
       return;
     }
     if (method === "POST" && url.pathname === "/api/login/poll") {
-      sendJson(
-        response,
-        200,
-        await options.client.request("/v1/channels/weixin-main/login/poll", {
-          method: "POST",
-          body: JSON.stringify(body),
-        }),
-      );
+      sendJson(response, 200, await options.client.pollLogin(body));
       return;
     }
     if (method === "POST" && url.pathname === "/api/aliases") {
       sendJson(
         response,
         200,
-        await options.client.request("/v1/workspace-aliases", {
-          method: "POST",
-          body: JSON.stringify({ ...body, classification: "personal" }),
+        await options.client.upsertWorkspaceAlias({
+          ...body,
+          classification: "personal",
         }),
       );
       return;
@@ -287,10 +315,7 @@ async function handleCanvasRequest(options, secret, request, response) {
       sendJson(
         response,
         200,
-        await options.client.request("/v1/allowed-senders", {
-          method: "POST",
-          body: JSON.stringify(body),
-        }),
+        await options.client.allowSender(body),
       );
       return;
     }
@@ -299,9 +324,9 @@ async function handleCanvasRequest(options, secret, request, response) {
       sendJson(
         response,
         200,
-        await options.client.request("/v1/bindings", {
-          method: "POST",
-          body: JSON.stringify({ ...body, sessionId: session.sessionId }),
+        await options.client.upsertBinding({
+          ...body,
+          sessionId: session.sessionId,
         }),
       );
       return;
@@ -310,10 +335,7 @@ async function handleCanvasRequest(options, secret, request, response) {
       sendJson(
         response,
         200,
-        await options.client.request("/v1/approvals/admin-decision", {
-          method: "POST",
-          body: JSON.stringify(body),
-        }),
+        await options.client.decideApprovalByAdmin(body),
       );
       return;
     }

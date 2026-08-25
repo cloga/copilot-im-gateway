@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -7,29 +7,55 @@ import {
 } from "node:http";
 import { URL } from "node:url";
 import { ZodError, type ZodType } from "zod";
+import {
+  canonicalizeIdentityComponents,
+  deferInboundMessage,
+} from "../core/contracts.js";
 import { GatewayError, gatewayErrorCodes, toErrorEnvelope } from "../core/errors.js";
 import { constantTimeTokenEqual } from "../core/security.js";
 import type { GatewayService } from "./gateway.js";
 import {
-  allowedSenderSchema,
-  adminApprovalDecisionSchema,
-  approvalConsumeSchema,
-  approvalDecisionSchema,
-  approvalRequestSchema,
-  bindingSchema,
-  completeMessageSchema,
-  inboundMessageSchema,
-  leaseRequestSchema,
-  loginPollSchema,
-  outboundMessageSchema,
-  workspaceAliasSchema,
+  legacyV1LoginPollSchema,
+  legacyV1WorkspaceAliasSchema,
+  v2AllowedSenderSchema,
+  v2AdminApprovalDecisionSchema,
+  v2ApprovalConsumeSchema,
+  v2ApprovalDecisionSchema,
+  v2ApprovalRequestSchema,
+  v2BindingSchema,
+  v2CompleteMessageSchema,
+  v2InboundMessageSchema,
+  v2LeaseRequestSchema,
+  v2LoginPollSchema,
+  v2OutboundMessageSchema,
+  v2ShutdownIdentityRequestSchema,
+  v2ShutdownRequestSchema,
+  v2WorkspaceAliasSchema,
 } from "./schemas.js";
 
 const maxBodyBytes = 1024 * 1024;
+const shutdownChallengeTtlMs = 10_000;
+const shutdownChallengeReplayRetentionMs = 5 * 60_000;
+const maxShutdownChallenges = 64;
+export const gatewayApiVersion = 2;
+export const gatewayCapabilities = [
+  "account-scoped-routing",
+  "sender-bound-routing",
+  "operation-bound-approvals",
+  "reservation-ownership",
+] as const;
 
-export interface GatewayHttpServerOptions {
+export interface GatewayHttpHandlerOptions {
   service: GatewayService;
   bearerToken: string;
+  onShutdown?: () => Promise<void> | void;
+  shutdownProtocolDependencies?: {
+    now?: () => number;
+    createId?: () => string;
+  };
+}
+
+export interface GatewayHttpServerOptions extends GatewayHttpHandlerOptions {
   port: number;
 }
 
@@ -37,6 +63,261 @@ export interface RunningGatewayServer {
   server: Server;
   url: string;
   close(): Promise<void>;
+}
+
+export interface ReservedGatewayHttpServer extends RunningGatewayServer {
+  activate(options: GatewayHttpHandlerOptions): RunningGatewayServer;
+}
+
+interface ShutdownOwner {
+  pid: number;
+  creationMarker: string;
+  executablePath: string;
+  entrypoint: string;
+}
+
+interface ShutdownIdentityRequest {
+  protocolVersion: 1;
+  owner: ShutdownOwner;
+  port: number;
+  clientNonce: string;
+  requestProof: string;
+}
+
+interface ShutdownRequest {
+  protocolVersion: 1;
+  instanceId: string;
+  challengeId: string;
+  clientNonce: string;
+  responseProof: string;
+}
+
+interface ShutdownChallengeRecord {
+  instanceId: string;
+  challengeId: string;
+  clientNonce: string;
+  responseProof: string;
+  expiresAtMs: number;
+  retainedUntilMs: number;
+  state: "active" | "consumed" | "expired";
+}
+
+function shutdownProof(
+  bearerToken: string,
+  purpose: "identity-request" | "identity-response",
+  values: readonly string[],
+): string {
+  return createHmac("sha256", bearerToken)
+    .update(
+      canonicalizeIdentityComponents([
+        "copilot-im-gateway-shutdown",
+        "1",
+        purpose,
+        ...values,
+      ]),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+class ShutdownChallengeRegistry {
+  readonly #bearerToken: string;
+  readonly #processId: number;
+  readonly #port: number;
+  readonly #now: () => number;
+  readonly #createId: () => string;
+  readonly #instanceId: string;
+  readonly #challenges = new Map<string, ShutdownChallengeRecord>();
+
+  constructor(options: {
+    bearerToken: string;
+    processId: number;
+    port: number;
+    now: () => number;
+    createId: () => string;
+  }) {
+    this.#bearerToken = options.bearerToken;
+    this.#processId = options.processId;
+    this.#port = options.port;
+    this.#now = options.now;
+    this.#createId = options.createId;
+    this.#instanceId = this.#createId();
+  }
+
+  issue(input: ShutdownIdentityRequest): {
+    protocolVersion: 1;
+    apiVersion: number;
+    capabilities: typeof gatewayCapabilities;
+    instanceId: string;
+    challengeId: string;
+    owner: ShutdownOwner;
+    port: number;
+    clientNonce: string;
+    expiresAt: number;
+    responseProof: string;
+  } {
+    const requestProof = shutdownProof(
+      this.#bearerToken,
+      "identity-request",
+      [
+        String(input.owner.pid),
+        input.owner.creationMarker,
+        String(input.port),
+        input.clientNonce,
+        input.owner.executablePath,
+        input.owner.entrypoint,
+      ],
+    );
+    if (
+      input.owner.pid !== this.#processId ||
+      input.port !== this.#port ||
+      !constantTimeTokenEqual(input.requestProof, requestProof)
+    ) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.authenticationRequired,
+        message: "Gateway shutdown identity proof is invalid.",
+        status: 401,
+      });
+    }
+
+    const now = this.#readNow();
+    this.#cleanupRetained(now);
+    if (
+      [...this.#challenges.values()].some(
+        (challenge) => challenge.clientNonce === input.clientNonce,
+      )
+    ) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.shutdownChallengeReplayed,
+        message: "Gateway shutdown identity nonce was already used.",
+        status: 409,
+      });
+    }
+    if (this.#challenges.size >= maxShutdownChallenges) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.shutdownChallengeCapacityExceeded,
+        message: "Gateway shutdown challenge capacity is temporarily exhausted.",
+        status: 503,
+        retryable: true,
+      });
+    }
+
+    const challengeId = this.#createId();
+    if (this.#challenges.has(challengeId)) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.internal,
+        message: "Gateway shutdown challenge generation failed.",
+        status: 500,
+      });
+    }
+    const expiresAtMs = now + shutdownChallengeTtlMs;
+    const responseProof = shutdownProof(
+      this.#bearerToken,
+      "identity-response",
+      [
+        String(gatewayApiVersion),
+        this.#instanceId,
+        challengeId,
+        String(input.owner.pid),
+        input.owner.creationMarker,
+        String(input.port),
+        input.clientNonce,
+        String(expiresAtMs),
+        input.owner.executablePath,
+        input.owner.entrypoint,
+      ],
+    );
+    this.#challenges.set(challengeId, {
+      instanceId: this.#instanceId,
+      challengeId,
+      clientNonce: input.clientNonce,
+      responseProof,
+      expiresAtMs,
+      retainedUntilMs:
+        expiresAtMs + shutdownChallengeReplayRetentionMs,
+      state: "active",
+    });
+    return {
+      protocolVersion: 1,
+      apiVersion: gatewayApiVersion,
+      capabilities: gatewayCapabilities,
+      instanceId: this.#instanceId,
+      challengeId,
+      owner: input.owner,
+      port: input.port,
+      clientNonce: input.clientNonce,
+      expiresAt: expiresAtMs,
+      responseProof,
+    };
+  }
+
+  consume(input: ShutdownRequest): void {
+    const now = this.#readNow();
+    this.#cleanupRetained(now);
+    const challenge = this.#challenges.get(input.challengeId);
+    if (challenge === undefined) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.shutdownChallengeInvalid,
+        message: "Gateway shutdown challenge is invalid.",
+        status: 401,
+      });
+    }
+    if (challenge.state === "consumed") {
+      throw new GatewayError({
+        code: gatewayErrorCodes.shutdownChallengeReplayed,
+        message: "Gateway shutdown challenge was already consumed.",
+        status: 409,
+      });
+    }
+    if (challenge.state === "expired" || now >= challenge.expiresAtMs) {
+      challenge.state = "expired";
+      throw new GatewayError({
+        code: gatewayErrorCodes.shutdownChallengeExpired,
+        message: "Gateway shutdown challenge expired.",
+        status: 409,
+      });
+    }
+    if (
+      input.instanceId !== challenge.instanceId ||
+      input.clientNonce !== challenge.clientNonce ||
+      !constantTimeTokenEqual(input.responseProof, challenge.responseProof)
+    ) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.shutdownChallengeInvalid,
+        message: "Gateway shutdown challenge is invalid.",
+        status: 401,
+      });
+    }
+    challenge.state = "consumed";
+  }
+
+  #readNow(): number {
+    const now = this.#now();
+    if (!Number.isSafeInteger(now)) {
+      throw new Error("Shutdown challenge clock returned an invalid timestamp.");
+    }
+    return now;
+  }
+
+  #cleanupRetained(now: number): void {
+    for (const [challengeId, challenge] of this.#challenges) {
+      if (challenge.retainedUntilMs <= now) {
+        this.#challenges.delete(challengeId);
+      } else if (
+        challenge.state === "active" &&
+        challenge.expiresAtMs <= now
+      ) {
+        challenge.state = "expired";
+      }
+    }
+  }
+}
+
+interface ActiveGatewayHttpHandlerOptions {
+  service: GatewayService;
+  bearerToken: string;
+  onShutdown?: () => Promise<void> | void;
+  shutdownChallenges: ShutdownChallengeRegistry;
 }
 
 function isLoopbackOrigin(origin: string): boolean {
@@ -125,15 +406,56 @@ function authenticate(
   }
 }
 
-export async function startGatewayHttpServer(
-  options: GatewayHttpServerOptions,
-): Promise<RunningGatewayServer> {
+function isUnsafeLegacyV1Operation(method: string, pathname: string): boolean {
+  if (method !== "POST") {
+    return false;
+  }
+  return (
+    pathname === "/v1/allowed-senders" ||
+    pathname === "/v1/bindings" ||
+    pathname === "/v1/inbound" ||
+    pathname === "/v1/messages/lease" ||
+    /^\/v1\/messages\/\d+\/complete$/.test(pathname) ||
+    pathname === "/v1/outbound" ||
+    pathname === "/v1/approvals" ||
+    pathname === "/v1/approvals/decision" ||
+    pathname === "/v1/approvals/admin-decision" ||
+    pathname === "/v1/approvals/consume"
+  );
+}
+
+export async function reserveGatewayHttpServer(
+  port: number,
+): Promise<ReservedGatewayHttpServer> {
+  let handlerOptions: ActiveGatewayHttpHandlerOptions | undefined;
+  let activated = false;
+  let closed = false;
   const server = createServer((request, response) => {
+    const options = handlerOptions;
+    if (options === undefined) {
+      const requestId = randomUUID();
+      response.setHeader("X-Request-Id", requestId);
+      setCorsHeaders(request, response);
+      sendJson(
+        response,
+        503,
+        toErrorEnvelope(
+          new GatewayError({
+            code: gatewayErrorCodes.internal,
+            message: "The gateway is still starting.",
+            status: 503,
+            retryable: true,
+          }),
+          requestId,
+        ),
+      );
+      return;
+    }
     void handleRequest(options, request, response);
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(options.port, "127.0.0.1", () => {
+    server.listen(port, "127.0.0.1", () => {
       server.off("error", reject);
       resolve();
     });
@@ -142,24 +464,90 @@ export async function startGatewayHttpServer(
   if (address === null || typeof address === "string") {
     throw new Error("Gateway server did not expose a TCP address.");
   }
-  return {
+  const close = async (): Promise<void> => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    if (!server.listening) {
+      return;
+    }
+    await new Promise<void>((resolve, reject) => {
+      server.close((error) => {
+        if (error === undefined) {
+          resolve();
+        } else {
+          reject(error);
+        }
+      });
+    });
+  };
+  const running: RunningGatewayServer = {
     server,
     url: `http://127.0.0.1:${address.port}`,
-    close: () =>
-      new Promise<void>((resolve, reject) => {
-        server.close((error) => {
-          if (error === undefined) {
-            resolve();
-          } else {
-            reject(error);
-          }
-        });
-      }),
+    close,
+  };
+  return {
+    ...running,
+    activate(options): RunningGatewayServer {
+      if (closed) {
+        throw new Error("Gateway HTTP reservation is already closed.");
+      }
+      if (activated) {
+        throw new Error("Gateway HTTP reservation is already active.");
+      }
+      const onShutdown = options.onShutdown;
+      let shutdownScheduled = false;
+      const shutdownProtocolDependencies =
+        options.shutdownProtocolDependencies ?? {};
+      handlerOptions = {
+        service: options.service,
+        bearerToken: options.bearerToken,
+        shutdownChallenges: new ShutdownChallengeRegistry({
+          bearerToken: options.bearerToken,
+          processId: process.pid,
+          port: address.port,
+          now: shutdownProtocolDependencies.now ?? Date.now,
+          createId: shutdownProtocolDependencies.createId ?? randomUUID,
+        }),
+        ...(onShutdown === undefined
+          ? {}
+          : {
+              onShutdown: () => {
+                if (shutdownScheduled) {
+                  return;
+                }
+                shutdownScheduled = true;
+                setImmediate(() => {
+                  void Promise.resolve()
+                    .then(onShutdown)
+                    .catch((error: unknown) => {
+                      console.error("Gateway shutdown callback failed.", error);
+                    });
+                });
+              },
+            }),
+      };
+      activated = true;
+      return running;
+    },
   };
 }
 
-async function handleRequest(
+export async function startGatewayHttpServer(
   options: GatewayHttpServerOptions,
+): Promise<RunningGatewayServer> {
+  const reservation = await reserveGatewayHttpServer(options.port);
+  try {
+    return reservation.activate(options);
+  } catch (error) {
+    await reservation.close();
+    throw error;
+  }
+}
+
+async function handleRequest(
+  options: ActiveGatewayHttpHandlerOptions,
   request: IncomingMessage,
   response: ServerResponse,
 ): Promise<void> {
@@ -191,13 +579,44 @@ async function handleRequest(
       return;
     }
 
+    if (method === "POST" && pathname === "/v2/admin/identity") {
+      const input = await readJson(request, v2ShutdownIdentityRequestSchema);
+      sendJson(response, 200, options.shutdownChallenges.issue(input));
+      return;
+    }
+
     authenticate(request, options.bearerToken);
 
+    if (method === "POST" && pathname === "/v2/admin/shutdown") {
+      if (options.onShutdown === undefined) {
+        throw new GatewayError({
+          code: gatewayErrorCodes.internal,
+          message: "Gateway shutdown is not available.",
+          status: 503,
+        });
+      }
+      const input = await readJson(request, v2ShutdownRequestSchema);
+      options.shutdownChallenges.consume(input);
+      sendJson(response, 202, { accepted: true });
+      void options.onShutdown();
+      return;
+    }
     if (method === "GET" && pathname === "/v1/status") {
       sendJson(response, 200, options.service.getStatus());
       return;
     }
-    if (method === "GET" && pathname === "/v1/audit") {
+    if (method === "GET" && pathname === "/v2/status") {
+      sendJson(response, 200, {
+        apiVersion: gatewayApiVersion,
+        capabilities: gatewayCapabilities,
+        ...options.service.getStatus(),
+      });
+      return;
+    }
+    if (
+      method === "GET" &&
+      (pathname === "/v1/audit" || pathname === "/v2/audit")
+    ) {
       const limit = Math.min(
         500,
         Math.max(1, Number(requestUrl.searchParams.get("limit") ?? 100)),
@@ -205,8 +624,17 @@ async function handleRequest(
       sendJson(response, 200, { events: options.service.store.listAudit(limit) });
       return;
     }
-    if (method === "POST" && pathname === "/v1/workspace-aliases") {
-      const input = await readJson(request, workspaceAliasSchema);
+    if (
+      method === "POST" &&
+      (pathname === "/v1/workspace-aliases" ||
+        pathname === "/v2/workspace-aliases")
+    ) {
+      const input = await readJson(
+        request,
+        pathname.startsWith("/v1/")
+          ? legacyV1WorkspaceAliasSchema
+          : v2WorkspaceAliasSchema,
+      );
       const now = new Date().toISOString();
       options.service.store.upsertWorkspaceAlias(
         input.alias,
@@ -214,35 +642,63 @@ async function handleRequest(
         input.classification,
         now,
       );
-      options.service.store.appendAudit({
-        createdAt: now,
-        eventType: "workspace.alias.updated",
-        actor: "local-admin",
-        details: { alias: input.alias, classification: input.classification },
-      });
       sendJson(response, 200, options.service.store.getWorkspaceAlias(input.alias));
       return;
     }
-    if (method === "POST" && pathname === "/v1/allowed-senders") {
-      const input = await readJson(request, allowedSenderSchema);
+    const loginStartMatch =
+      /^\/v1\/channels\/([^/]+)\/login\/start$/.exec(pathname) ??
+      /^\/v2\/channels\/([^/]+)\/login\/start$/.exec(pathname);
+    if (method === "POST" && loginStartMatch !== null) {
+      const channelId = decodeURIComponent(loginStartMatch[1] ?? "");
+      const snapshot = await options.service.getLoginChannel(channelId).startLogin();
+      sendJson(response, 200, snapshot);
+      return;
+    }
+    const loginPollMatch =
+      /^\/v1\/channels\/([^/]+)\/login\/poll$/.exec(pathname) ??
+      /^\/v2\/channels\/([^/]+)\/login\/poll$/.exec(pathname);
+    if (method === "POST" && loginPollMatch !== null) {
+      const channelId = decodeURIComponent(loginPollMatch[1] ?? "");
+      const input = await readJson(
+        request,
+        pathname.startsWith("/v1/")
+          ? legacyV1LoginPollSchema
+          : v2LoginPollSchema,
+      );
+      const snapshot = await options.service
+        .getLoginChannel(channelId)
+        .pollLogin(input.verifyCode);
+      sendJson(response, 200, snapshot);
+      return;
+    }
+
+    if (isUnsafeLegacyV1Operation(method, pathname)) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.upgradeRequired,
+        message:
+          "This operation requires the account-scoped v2 gateway extension.",
+        status: 426,
+      });
+    }
+
+    if (method === "POST" && pathname === "/v2/allowed-senders") {
+      const input = await readJson(request, v2AllowedSenderSchema);
       const now = new Date().toISOString();
       options.service.store.allowSender(
-        input.channelId,
-        input.senderId,
+        {
+          tenantId: input.tenantId,
+          channelId: input.channelId,
+          accountId: input.accountId,
+          senderId: input.senderId,
+        },
         input.displayName,
         now,
       );
-      options.service.store.appendAudit({
-        createdAt: now,
-        eventType: "sender.allowed",
-        actor: "local-admin",
-        details: { channelId: input.channelId, senderId: input.senderId },
-      });
       sendJson(response, 201, { ok: true });
       return;
     }
-    if (method === "POST" && pathname === "/v1/bindings") {
-      const input = await readJson(request, bindingSchema);
+    if (method === "POST" && pathname === "/v2/bindings") {
+      const input = await readJson(request, v2BindingSchema);
       const workspace = options.service.store.getWorkspaceAlias(
         input.workspaceAlias,
       );
@@ -258,23 +714,15 @@ async function handleRequest(
         input,
         new Date().toISOString(),
       );
-      options.service.store.appendAudit({
-        createdAt: new Date().toISOString(),
-        eventType: "session.binding.updated",
-        actor: "local-admin",
-        routeKey: binding.routeKey,
-        details: {
-          sessionId: binding.sessionId,
-          workspaceAlias: binding.workspaceAlias,
-        },
-      });
       sendJson(response, 200, binding);
       return;
     }
-    if (method === "POST" && pathname === "/v1/inbound") {
-      const input = await readJson(request, inboundMessageSchema);
-      await options.service.onInbound({
+    if (method === "POST" && pathname === "/v2/inbound") {
+      const input = await readJson(request, v2InboundMessageSchema);
+      await options.service.onInbound(deferInboundMessage({
+        tenantId: input.tenantId,
         channelId: input.channelId,
+        accountId: input.accountId,
         conversationId: input.conversationId,
         messageId: input.messageId,
         senderId: input.senderId,
@@ -293,33 +741,12 @@ async function handleRequest(
         ...(input.replyToMessageId === undefined
           ? {}
           : { replyToMessageId: input.replyToMessageId }),
-      });
+      }));
       sendJson(response, 202, { accepted: true });
       return;
     }
-    const loginStartMatch = /^\/v1\/channels\/([^/]+)\/login\/start$/.exec(
-      pathname,
-    );
-    if (method === "POST" && loginStartMatch !== null) {
-      const channelId = decodeURIComponent(loginStartMatch[1] ?? "");
-      const snapshot = await options.service.getLoginChannel(channelId).startLogin();
-      sendJson(response, 200, snapshot);
-      return;
-    }
-    const loginPollMatch = /^\/v1\/channels\/([^/]+)\/login\/poll$/.exec(
-      pathname,
-    );
-    if (method === "POST" && loginPollMatch !== null) {
-      const channelId = decodeURIComponent(loginPollMatch[1] ?? "");
-      const input = await readJson(request, loginPollSchema);
-      const snapshot = await options.service
-        .getLoginChannel(channelId)
-        .pollLogin(input.verifyCode);
-      sendJson(response, 200, snapshot);
-      return;
-    }
-    if (method === "POST" && pathname === "/v1/messages/lease") {
-      const input = await readJson(request, leaseRequestSchema);
+    if (method === "POST" && pathname === "/v2/messages/lease") {
+      const input = await readJson(request, v2LeaseRequestSchema);
       const leased = options.service.leaseInbound(
         input.sessionId,
         input.leaseSeconds,
@@ -327,61 +754,54 @@ async function handleRequest(
       sendJson(response, 200, { message: leased ?? null });
       return;
     }
-    const completeMatch = /^\/v1\/messages\/(\d+)\/complete$/.exec(pathname);
+    const completeMatch = /^\/v2\/messages\/(\d+)\/complete$/.exec(pathname);
     if (method === "POST" && completeMatch !== null) {
       const id = Number(completeMatch[1]);
-      const input = await readJson(request, completeMessageSchema);
-      options.service.store.completeInbound(
+      const input = await readJson(request, v2CompleteMessageSchema);
+      options.service.completeInbound({
         id,
-        input.leaseId,
-        input.outcome,
-        input.errorCode,
-      );
+        leaseId: input.leaseId,
+        outcome: input.outcome,
+        ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
+        retryable: input.retryable,
+      });
       sendJson(response, 200, { ok: true });
       return;
     }
-    if (method === "POST" && pathname === "/v1/outbound") {
-      const input = await readJson(request, outboundMessageSchema);
+    if (method === "POST" && pathname === "/v2/outbound") {
+      const input = await readJson(request, v2OutboundMessageSchema);
       const chunks = await options.service.sendOutbound(input);
       sendJson(response, 202, { accepted: true, chunks });
       return;
     }
-    if (method === "POST" && pathname === "/v1/approvals") {
-      const input = await readJson(request, approvalRequestSchema);
+    if (method === "POST" && pathname === "/v2/approvals") {
+      const input = await readJson(request, v2ApprovalRequestSchema);
       const approval = options.service.createApproval(input);
       sendJson(response, 201, approval);
       return;
     }
-    if (method === "POST" && pathname === "/v1/approvals/decision") {
-      const input = await readJson(request, approvalDecisionSchema);
+    if (method === "POST" && pathname === "/v2/approvals/decision") {
+      const input = await readJson(request, v2ApprovalDecisionSchema);
       const record = options.service.decideApproval(input);
       sendJson(response, 200, record);
       return;
     }
-    if (method === "POST" && pathname === "/v1/approvals/admin-decision") {
-      const input = await readJson(request, adminApprovalDecisionSchema);
+    if (method === "POST" && pathname === "/v2/approvals/admin-decision") {
+      const input = await readJson(request, v2AdminApprovalDecisionSchema);
       const now = new Date().toISOString();
       const record = options.service.store.decideApprovalByRequestId({
         ...input,
         now,
       });
-      options.service.store.appendAudit({
-        createdAt: now,
-        eventType: `approval.${input.decision}`,
-        actor: "local-admin",
-        routeKey: `${record.identity.channelId}:${record.identity.conversationId}`,
-        details: { requestId: record.requestId },
-      });
       sendJson(response, 200, record);
       return;
     }
-    if (method === "POST" && pathname === "/v1/approvals/consume") {
-      const input = await readJson(request, approvalConsumeSchema);
-      const record = options.service.store.consumeApproval(
-        input.requestId,
-        input.sessionId,
-        new Date().toISOString(),
-      );
+    if (method === "POST" && pathname === "/v2/approvals/consume") {
+      const input = await readJson(request, v2ApprovalConsumeSchema);
+      const record = options.service.store.consumeApproval({
+        ...input,
+        now: new Date().toISOString(),
+      });
       sendJson(response, 200, { approval: record ?? null });
       return;
     }

@@ -3,7 +3,9 @@ import path from "node:path";
 
 /**
  * @typedef {{
+ *   tenantId:string,
  *   channelId:string,
+ *   accountId:string,
  *   conversationId:string,
  *   senderId:string,
  *   sessionId:string,
@@ -18,7 +20,9 @@ import path from "node:path";
  *   leaseId:string,
  *   workspaceAlias:string,
  *   message:{
+ *     tenantId:string,
  *     channelId:string,
+ *     accountId:string,
  *     conversationId:string,
  *     senderId:string,
  *     messageId:string,
@@ -31,7 +35,9 @@ import path from "node:path";
  * @param {{
  *   client: import("./gateway-client.mjs").GatewayClient,
  *   getActiveTurn: () => {
+ *     tenantId:string,
  *     channelId:string,
+ *     accountId:string,
  *     conversationId:string,
  *     senderId:string,
  *     sessionId:string,
@@ -75,7 +81,9 @@ export function createPermissionHandler(options) {
     const approval = await options.client.createApproval({
       requestId,
       identity: {
+        tenantId: turn.tenantId,
         channelId: turn.channelId,
+        accountId: turn.accountId,
         conversationId: turn.conversationId,
         senderId: turn.senderId,
         sessionId: turn.sessionId,
@@ -84,8 +92,11 @@ export function createPermissionHandler(options) {
       ttlSeconds: 300,
     });
     await options.client.sendOutbound({
+      tenantId: turn.tenantId,
       channelId: turn.channelId,
+      accountId: turn.accountId,
       conversationId: turn.conversationId,
+      senderId: turn.senderId,
       correlationId: `approval-${requestId}`,
       text:
         `Approval required (${scope.kind})\n${scope.summary}\n` +
@@ -96,7 +107,15 @@ export function createPermissionHandler(options) {
     while (!options.signal.aborted) {
       const result = await options.client.consumeApproval(
         requestId,
-        turn.sessionId,
+        {
+          tenantId: turn.tenantId,
+          channelId: turn.channelId,
+          accountId: turn.accountId,
+          conversationId: turn.conversationId,
+          senderId: turn.senderId,
+          sessionId: turn.sessionId,
+        },
+        approval.operationDigest,
       );
       const record = result.approval;
       if (record?.status === "approved") {
@@ -157,6 +176,7 @@ export async function runInboundLoop(options) {
  */
 export async function processInboundTurn(leased, options) {
   const message = leased.message;
+  let retryable = true;
   try {
     const status =
       /** @type {{workspaceAliases:Array<{alias:string,path:string,classification:string}>}} */ (
@@ -170,6 +190,7 @@ export async function processInboundTurn(leased, options) {
       alias.classification !== "personal" ||
       !samePath(alias.path, options.workspacePath)
     ) {
+      retryable = false;
       throw new Error(
         "Bound workspace alias does not match the current personal workspace.",
       );
@@ -196,7 +217,9 @@ export async function processInboundTurn(leased, options) {
     }
 
     options.setActiveTurn({
+      tenantId: message.tenantId,
       channelId: message.channelId,
+      accountId: message.accountId,
       conversationId: message.conversationId,
       senderId: message.senderId,
       sessionId: options.session.sessionId,
@@ -223,6 +246,7 @@ export async function processInboundTurn(leased, options) {
       leased.leaseId,
       "failed",
       "REMOTE_TURN_FAILED",
+      retryable,
     );
     await reply(
       options.client,
@@ -245,8 +269,11 @@ export async function processInboundTurn(leased, options) {
  */
 async function reply(client, message, text) {
   await client.sendOutbound({
+    tenantId: message.tenantId,
     channelId: message.channelId,
+    accountId: message.accountId,
     conversationId: message.conversationId,
+    senderId: message.senderId,
     correlationId: message.messageId,
     text,
   });

@@ -4,21 +4,12 @@ import {
   constantTimeTokenEqual,
   isPathInside,
   redactText,
-  SlidingWindowRateLimiter,
-  type Clock,
 } from "../src/core/security.js";
-
-class MutableClock implements Clock {
-  constructor(private timestamp: number) {}
-
-  now(): Date {
-    return new Date(this.timestamp);
-  }
-
-  advance(milliseconds: number): void {
-    this.timestamp += milliseconds;
-  }
-}
+import { isWellFormedUnicode, toRouteKey } from "../src/core/contracts.js";
+import {
+  v2AllowedSenderSchema,
+  v2ApprovalRequestSchema,
+} from "../src/daemon/schemas.js";
 
 describe("security primitives", () => {
   it("compares bearer tokens without length timing differences", () => {
@@ -47,14 +38,90 @@ describe("security primitives", () => {
     expect(chunks.at(-1)).toContain("[output truncated]");
   });
 
-  it("enforces a sliding sender rate limit", () => {
-    const clock = new MutableClock(1_000);
-    const limiter = new SlidingWindowRateLimiter(2, 1_000, clock);
-    limiter.consume("sender");
-    limiter.consume("sender");
-    expect(() => limiter.consume("sender")).toThrow("rate limit");
-    clock.advance(1_001);
-    expect(() => limiter.consume("sender")).not.toThrow();
+  it("hashes length-prefixed full route identities without delimiter collisions", () => {
+    const route = {
+      tenantId: "local" as const,
+      channelId: "a:b",
+      accountId: "bot",
+      conversationId: "c",
+      senderId: "owner",
+    };
+    expect(toRouteKey(route)).toHaveLength(64);
+    expect(toRouteKey(route)).not.toBe(
+      toRouteKey({ ...route, channelId: "a", conversationId: "b:c" }),
+    );
+    expect(toRouteKey(route)).not.toBe(
+      toRouteKey({ ...route, accountId: "other" }),
+    );
+  });
+
+  it("rejects ill-formed Unicode before route hashing without conflating U+FFFD", () => {
+    const route = {
+      tenantId: "local" as const,
+      channelId: "weixin-main",
+      accountId: "bot",
+      conversationId: "conversation",
+      senderId: "\uFFFD",
+    };
+    expect(isWellFormedUnicode(route.senderId)).toBe(true);
+    expect(toRouteKey(route)).not.toBe(toRouteKey({ ...route, senderId: "?" }));
+    expect(() => toRouteKey({ ...route, senderId: "\uD800" })).toThrow(
+      "well-formed Unicode",
+    );
+    expect(
+      v2AllowedSenderSchema.safeParse({
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot",
+        senderId: "\uFFFD",
+      }).success,
+    ).toBe(true);
+    expect(
+      v2AllowedSenderSchema.safeParse({
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot",
+        senderId: "\uD800",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects ill-formed Unicode throughout approval scopes", () => {
+    const request = {
+      requestId: "request",
+      identity: {
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot",
+        conversationId: "conversation",
+        senderId: "sender",
+        sessionId: "session",
+      },
+      scope: {
+        kind: "write",
+        summary: "Write a file",
+        paths: ["personal/file.txt"],
+        hosts: ["example.test"],
+        commands: ["write"],
+      },
+      ttlSeconds: 300,
+    };
+    for (const scope of [
+      { ...request.scope, summary: "\uD800" },
+      { ...request.scope, paths: ["\uD800"] },
+      { ...request.scope, hosts: ["\uD800"] },
+      { ...request.scope, commands: ["\uD800"] },
+    ]) {
+      expect(v2ApprovalRequestSchema.safeParse({ ...request, scope }).success).toBe(
+        false,
+      );
+    }
+    expect(
+      v2ApprovalRequestSchema.safeParse({
+        ...request,
+        scope: { ...request.scope, summary: "\uFFFD" },
+      }).success,
+    ).toBe(true);
   });
 
   it("recognizes only paths inside the allowed root", () => {

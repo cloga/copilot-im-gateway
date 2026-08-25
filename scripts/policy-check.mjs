@@ -9,10 +9,18 @@ const policy = JSON.parse(
   readFileSync(path.join(root, ".github", "agent-policy.json"), "utf8"),
 );
 const base = findBase(policy.defaultBranch);
-const headRef =
-  process.env.AGENT_POLICY_HEAD_REF ??
-  process.env.GITHUB_HEAD_REF ??
-  currentBranch();
+const eventHeadRef =
+  process.env.AGENT_POLICY_HEAD_REF ?? process.env.GITHUB_HEAD_REF;
+const trustedHeadRef =
+  eventHeadRef &&
+  process.env.GITHUB_REF_TYPE !== "tag" &&
+  eventHeadRef !== policy.defaultBranch
+    ? eventHeadRef
+    : `${policy.branchAccount}/local-policy`;
+const headCommit = git(["rev-parse", "HEAD"]).stdout.trim();
+const trustedAuthor = trustedHeadRef.startsWith("dependabot/")
+  ? policy.automationAccount
+  : policy.branchAccount;
 
 const changes = parseNameStatus(
   git(["diff", "--name-status", "--find-renames", base, "--"]).stdout,
@@ -26,26 +34,28 @@ for (const file of git(["ls-files", "--others", "--exclude-standard"]).stdout
 const result = evaluatePolicy({
   policy,
   changes,
-  headRef:
-    process.env.GITHUB_REF_TYPE === "tag" ? policy.defaultBranch : headRef,
-  identity: {
+  trust: {
+    workflowSha: headCommit,
+    eventName: "pull_request",
+    eventAction: "synchronize",
+    repositoryFullName: policy.repositoryFullName,
+    repositoryId: "1343812506",
+    baseSha: base,
     baseRef: policy.defaultBranch,
     baseRepoFullName: policy.repositoryFullName,
+    baseRepoId: "1343812506",
+    headSha: headCommit,
+    headRef: trustedHeadRef,
     headRepoOwner: policy.branchAccount,
     headRepoFullName: policy.repositoryFullName,
-    prAuthor: headRef.startsWith("dependabot/")
-      ? policy.automationAccount
-      : policy.branchAccount,
-    eventAction: "synchronize",
-    eventActor: headRef.startsWith("dependabot/")
-      ? policy.automationAccount
-      : policy.branchAccount,
-    headProvenanceVerified: true,
+    headRepoId: "1343812506",
+    prAuthor: trustedAuthor,
+    actor: trustedAuthor,
   },
-  manualGovernanceApproved: false,
-  enforceManualApproval: false,
   readBase: (file) => readAtOptional(base, file),
+  readTrusted: (file) => readWorkingFile(file),
   readHead: (file) => readWorkingFile(file),
+  listTrustedFiles: (directory) => listWorkingFiles(directory),
   listHeadFiles: (directory) => listWorkingFiles(directory),
 });
 
@@ -64,10 +74,6 @@ function findBase(defaultBranch) {
     }
   }
   return git(["rev-parse", "HEAD^"]).stdout.trim();
-}
-
-function currentBranch() {
-  return git(["branch", "--show-current"]).stdout.trim();
 }
 
 /** @param {string} ref @param {string} file */

@@ -1,9 +1,33 @@
 import { randomBytes } from "node:crypto";
 import { z } from "zod";
+import { isWellFormedUnicode } from "../../core/contracts.js";
+
+const protocolString = z
+  .string()
+  .refine(isWellFormedUnicode, "Protocol string must be well-formed Unicode.");
+const protocolIdentifier = z
+  .string()
+  .refine(isWellFormedUnicode, "Identifier must be well-formed Unicode.");
+const protocolHeaderValue = z
+  .string()
+  .min(1)
+  .refine(isWellFormedUnicode, "Header value must be well-formed Unicode.")
+  .refine(
+    (value) =>
+      !Array.from(value).some((character) => {
+        const codePoint = character.codePointAt(0);
+        return (
+          codePoint !== undefined && (codePoint <= 0x1f || codePoint === 0x7f)
+        );
+      }),
+    "Header value must not contain control characters.",
+  );
+const protocolUrl = protocolString.pipe(z.string().url());
+const protocolToken = protocolString;
 
 const qrCodeResponseSchema = z.object({
-  qrcode: z.string().min(1),
-  qrcode_img_content: z.string().url(),
+  qrcode: protocolString.pipe(z.string().min(1)),
+  qrcode_img_content: protocolUrl,
 });
 
 const loginStatusSchema = z.object({
@@ -17,16 +41,16 @@ const loginStatusSchema = z.object({
     "verify_code_blocked",
     "binded_redirect",
   ]),
-  bot_token: z.string().optional(),
-  ilink_bot_id: z.string().optional(),
-  baseurl: z.string().url().optional(),
-  ilink_user_id: z.string().optional(),
-  redirect_host: z.string().optional(),
+  bot_token: protocolHeaderValue.optional(),
+  ilink_bot_id: protocolIdentifier.optional(),
+  baseurl: protocolUrl.optional(),
+  ilink_user_id: protocolIdentifier.optional(),
+  redirect_host: protocolString.optional(),
 });
 
 const messageItemSchema = z.object({
   type: z.number().int().optional(),
-  msg_id: z.string().optional(),
+  msg_id: protocolIdentifier.optional(),
   text_item: z.object({ text: z.string().optional() }).optional(),
   voice_item: z.object({ text: z.string().optional() }).optional(),
   image_item: z
@@ -52,14 +76,14 @@ const messageItemSchema = z.object({
 
 const weixinMessageSchema = z.object({
   message_id: z.number().optional(),
-  from_user_id: z.string().optional(),
-  to_user_id: z.string().optional(),
-  client_id: z.string().optional(),
+  from_user_id: protocolIdentifier.optional(),
+  to_user_id: protocolIdentifier.optional(),
+  client_id: protocolIdentifier.optional(),
   create_time_ms: z.number().optional(),
   message_type: z.number().optional(),
   item_list: z.array(messageItemSchema).optional(),
-  context_token: z.string().optional(),
-  run_id: z.string().optional(),
+  context_token: protocolToken.optional(),
+  run_id: protocolIdentifier.optional(),
 });
 
 const updatesResponseSchema = z.object({
@@ -67,8 +91,8 @@ const updatesResponseSchema = z.object({
   errcode: z.number().optional(),
   errmsg: z.string().optional(),
   msgs: z.array(weixinMessageSchema).optional(),
-  get_updates_buf: z.string().optional(),
-  longpolling_timeout_ms: z.number().int().positive().optional(),
+  get_updates_buf: protocolToken.optional(),
+  longpolling_timeout_ms: z.number().int().optional(),
 });
 
 const sendResponseSchema = z.object({
@@ -85,6 +109,19 @@ export interface WeixinCredentials {
   baseUrl: string;
   userId?: string;
 }
+
+const credentialsSchema = z.object({
+  botToken: protocolHeaderValue,
+  botId: protocolIdentifier,
+  baseUrl: protocolUrl,
+  userId: protocolIdentifier.optional(),
+});
+
+const loginPollInputSchema = z.object({
+  baseUrl: protocolUrl,
+  qrCode: protocolToken,
+  verifyCode: protocolToken.optional(),
+});
 
 export interface WeixinUpdates {
   messages: WeixinMessage[];
@@ -106,6 +143,7 @@ export interface WeixinProtocolClient {
   getUpdates(input: {
     credentials: WeixinCredentials;
     cursor: string;
+    desiredTimeoutMs?: number;
     signal: AbortSignal;
   }): Promise<WeixinUpdates>;
   sendText(input: {
@@ -133,10 +171,13 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
   readonly #fetch: typeof globalThis.fetch;
 
   constructor(options: FetchWeixinProtocolClientOptions = {}) {
-    this.#loginBaseUrl =
-      options.loginBaseUrl ?? "https://ilinkai.weixin.qq.com";
-    this.#appId = options.appId ?? "bot";
-    this.#channelVersion = options.channelVersion ?? "0.1.0";
+    this.#loginBaseUrl = protocolUrl.parse(
+      options.loginBaseUrl ?? "https://ilinkai.weixin.qq.com",
+    );
+    this.#appId = protocolHeaderValue.parse(options.appId ?? "bot");
+    this.#channelVersion = protocolHeaderValue.parse(
+      options.channelVersion ?? "0.1.0",
+    );
     this.#clientVersion = options.clientVersion ?? 256;
     this.#fetch = options.fetch ?? globalThis.fetch;
   }
@@ -144,12 +185,13 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
   async getLoginQr(
     localTokens: string[],
   ): Promise<{ id: string; url: string; pollingBaseUrl: string }> {
+    const validatedLocalTokens = z.array(protocolToken).parse(localTokens);
     const response = await this.#request(
       this.#loginBaseUrl,
       "/ilink/bot/get_bot_qrcode?bot_type=3",
       {
         method: "POST",
-        body: { local_token_list: localTokens.slice(-10) },
+        body: { local_token_list: validatedLocalTokens.slice(-10) },
         timeoutMs: 15_000,
       },
     );
@@ -166,13 +208,14 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
     qrCode: string;
     verifyCode?: string;
   }): Promise<WeixinLoginStatus> {
-    const query = new URLSearchParams({ qrcode: input.qrCode });
-    if (input.verifyCode !== undefined) {
-      query.set("verify_code", input.verifyCode);
+    const validated = loginPollInputSchema.parse(input);
+    const query = new URLSearchParams({ qrcode: validated.qrCode });
+    if (validated.verifyCode !== undefined) {
+      query.set("verify_code", validated.verifyCode);
     }
     try {
       const response = await this.#request(
-        input.baseUrl,
+        validated.baseUrl,
         `/ilink/bot/get_qrcode_status?${query.toString()}`,
         { method: "GET", timeoutMs: 35_000 },
       );
@@ -188,21 +231,24 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
   async getUpdates(input: {
     credentials: WeixinCredentials;
     cursor: string;
+    desiredTimeoutMs?: number;
     signal: AbortSignal;
   }): Promise<WeixinUpdates> {
+    const credentials = credentialsSchema.parse(input.credentials);
+    const cursor = protocolToken.parse(input.cursor);
     let response: unknown;
     try {
       response = await this.#request(
-        input.credentials.baseUrl,
+        credentials.baseUrl,
         "/ilink/bot/getupdates",
         {
           method: "POST",
           body: {
-            get_updates_buf: input.cursor,
+            get_updates_buf: cursor,
             base_info: this.#baseInfo(),
           },
-          token: input.credentials.botToken,
-          timeoutMs: 40_000,
+          token: credentials.botToken,
+          timeoutMs: Math.max(1_000, (input.desiredTimeoutMs ?? 35_000) + 5_000),
           signal: input.signal,
         },
       );
@@ -210,8 +256,8 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
       if (error instanceof Error && error.name === "AbortError") {
         return {
           messages: [],
-          cursor: input.cursor,
-          longPollingTimeoutMs: 35_000,
+          cursor,
+          longPollingTimeoutMs: input.desiredTimeoutMs ?? 35_000,
         };
       }
       throw error;
@@ -219,8 +265,16 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
     const parsed = updatesResponseSchema.parse(response);
     return {
       messages: parsed.msgs ?? [],
-      cursor: parsed.get_updates_buf ?? input.cursor,
-      longPollingTimeoutMs: parsed.longpolling_timeout_ms ?? 35_000,
+      cursor:
+        parsed.get_updates_buf !== undefined &&
+        parsed.get_updates_buf.length > 0
+          ? parsed.get_updates_buf
+          : cursor,
+      longPollingTimeoutMs:
+        parsed.longpolling_timeout_ms !== undefined &&
+        parsed.longpolling_timeout_ms > 0
+          ? parsed.longpolling_timeout_ms
+          : (input.desiredTimeoutMs ?? 35_000),
       ...(parsed.errcode === undefined ? {} : { errorCode: parsed.errcode }),
       ...(parsed.errmsg === undefined ? {} : { errorMessage: parsed.errmsg }),
     };
@@ -233,18 +287,22 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
     text: string;
     clientId: string;
   }): Promise<void> {
+    const credentials = credentialsSchema.parse(input.credentials);
+    const toUserId = protocolIdentifier.parse(input.toUserId);
+    const contextToken = protocolToken.parse(input.contextToken);
+    const clientId = protocolIdentifier.parse(input.clientId);
     const response = await this.#request(
-      input.credentials.baseUrl,
+      credentials.baseUrl,
       "/ilink/bot/sendmessage",
       {
         method: "POST",
-        token: input.credentials.botToken,
+        token: credentials.botToken,
         timeoutMs: 15_000,
         body: {
           msg: {
             from_user_id: "",
-            to_user_id: input.toUserId,
-            client_id: input.clientId,
+            to_user_id: toUserId,
+            client_id: clientId,
             message_type: 2,
             message_state: 2,
             item_list: [
@@ -253,7 +311,7 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
                 text_item: { text: input.text },
               },
             ],
-            context_token: input.contextToken,
+            context_token: contextToken,
           },
           base_info: this.#baseInfo(),
         },
@@ -285,13 +343,23 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
       signal?: AbortSignal;
     },
   ): Promise<unknown> {
+    const validatedBaseUrl = protocolUrl.parse(baseUrl);
+    const token =
+      options.token === undefined
+        ? undefined
+        : protocolHeaderValue.parse(options.token);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), options.timeoutMs);
     const abort = () => controller.abort();
     options.signal?.addEventListener("abort", abort, { once: true });
     try {
       const response = await this.#fetch(
-        new URL(endpoint, baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`),
+        new URL(
+          endpoint,
+          validatedBaseUrl.endsWith("/")
+            ? validatedBaseUrl
+            : `${validatedBaseUrl}/`,
+        ),
         {
           method: options.method,
           headers: {
@@ -306,9 +374,9 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
                   ).toString("base64"),
                 }
               : {}),
-            ...(options.token === undefined
+            ...(token === undefined
               ? {}
-              : { Authorization: options.token }),
+              : { Authorization: token }),
           },
           ...(options.body === undefined
             ? {}

@@ -1,0 +1,194 @@
+name: Required governance
+
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+      - edited
+  merge_group:
+    types:
+      - checks_requested
+
+permissions:
+  contents: read
+
+jobs:
+  required-policy:
+    name: Required policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate trusted event context
+        env:
+          ACTOR: ${{ github.actor }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_BASE_REF: ${{ github.event.merge_group.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_REPO_FULL_NAME: ${{ github.event.pull_request.base.repo.full_name }}
+          PR_BASE_REPO_ID: ${{ github.event.pull_request.base.repo.id }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_REPO_ID: ${{ github.event.pull_request.head.repo.id }}
+          PR_HEAD_REPO_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha_pattern='^[0-9a-f]{40}$'
+          test "$REPOSITORY" = "cloga/copilot-im-gateway"
+          test "$REPOSITORY_ID" = "1343812506"
+          [[ "$WORKFLOW_SHA" =~ $sha_pattern ]]
+          case "$EVENT_NAME" in
+            pull_request)
+              case "$EVENT_ACTION" in
+                opened|synchronize|reopened|ready_for_review|edited) ;;
+                *) exit 1 ;;
+              esac
+              test "$PR_BASE_REF" = "main"
+              test "$PR_BASE_REPO_FULL_NAME" = "$REPOSITORY"
+              test "$PR_BASE_REPO_ID" = "$REPOSITORY_ID"
+              test "$PR_HEAD_REPO_FULL_NAME" = "$REPOSITORY"
+              test "$PR_HEAD_REPO_ID" = "$REPOSITORY_ID"
+              test "$PR_HEAD_REPO_OWNER" = "cloga"
+              [[ "$PR_BASE_SHA" =~ $sha_pattern ]]
+              [[ "$PR_HEAD_SHA" =~ $sha_pattern ]]
+              [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+              if [[ "$PR_HEAD_REF" == cloga/* && "$PR_HEAD_REF" != "cloga/" ]]; then
+                expected_actor="cloga"
+              elif [[ "$PR_HEAD_REF" == dependabot/* && "$PR_HEAD_REF" != "dependabot/" ]]; then
+                expected_actor="dependabot[bot]"
+              else
+                exit 1
+              fi
+              test "$PR_AUTHOR" = "$expected_actor"
+              test "$ACTOR" = "$expected_actor"
+              ;;
+            merge_group)
+              test "$EVENT_ACTION" = "checks_requested"
+              test "$MERGE_BASE_REF" = "refs/heads/main"
+              [[ "$MERGE_BASE_SHA" =~ $sha_pattern ]]
+              [[ "$MERGE_HEAD_SHA" =~ $sha_pattern ]]
+              ;;
+            *) exit 1 ;;
+          esac
+      - name: Check out required workflow source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Set up trusted Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24.11.1
+          cache: npm
+      - name: Install trusted dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Fetch target and untrusted head as git data only
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha_pattern='^[0-9a-f]{40}$'
+          if [[ "$EVENT_NAME" = "pull_request" ]]; then
+            [[ "$PR_BASE_SHA" =~ $sha_pattern ]]
+            [[ "$PR_HEAD_SHA" =~ $sha_pattern ]]
+            [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+            base_sha="$PR_BASE_SHA"
+            head_sha="$PR_HEAD_SHA"
+            git fetch --no-tags --depth=1 origin "$base_sha"
+            git fetch --no-tags --depth=1 origin "refs/pull/$PR_NUMBER/head"
+          elif [[ "$EVENT_NAME" = "merge_group" ]]; then
+            [[ "$MERGE_BASE_SHA" =~ $sha_pattern ]]
+            [[ "$MERGE_HEAD_SHA" =~ $sha_pattern ]]
+            base_sha="$MERGE_BASE_SHA"
+            head_sha="$MERGE_HEAD_SHA"
+            git fetch --no-tags --depth=1 origin "$base_sha"
+            git fetch --no-tags --depth=1 origin "$head_sha"
+          else
+            exit 1
+          fi
+          test "$(git rev-parse FETCH_HEAD)" = "$head_sha"
+          git cat-file -e "$base_sha^{commit}"
+          git cat-file -e "$head_sha^{commit}"
+      - name: Evaluate required policy
+        env:
+          ACTOR: ${{ github.actor }}
+          EVENT_ACTION: ${{ github.event.action }}
+          EVENT_NAME: ${{ github.event_name }}
+          MERGE_BASE_REF: ${{ github.event.merge_group.base_ref }}
+          MERGE_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          MERGE_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_BASE_REPO_FULL_NAME: ${{ github.event.pull_request.base.repo.full_name }}
+          PR_BASE_REPO_ID: ${{ github.event.pull_request.base.repo.id }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_REPO_FULL_NAME: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_HEAD_REPO_ID: ${{ github.event.pull_request.head.repo.id }}
+          PR_HEAD_REPO_OWNER: ${{ github.event.pull_request.head.repo.owner.login }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" = "pull_request" ]]; then
+            node scripts/governance-check.mjs \
+              --workflow-sha "$WORKFLOW_SHA" \
+              --event-name "$EVENT_NAME" \
+              --event-action "$EVENT_ACTION" \
+              --repository "$REPOSITORY" \
+              --repository-id "$REPOSITORY_ID" \
+              --base "$PR_BASE_SHA" \
+              --base-ref "$PR_BASE_REF" \
+              --base-repo-full-name "$PR_BASE_REPO_FULL_NAME" \
+              --base-repo-id "$PR_BASE_REPO_ID" \
+              --head "$PR_HEAD_SHA" \
+              --head-ref "$PR_HEAD_REF" \
+              --head-repo-owner "$PR_HEAD_REPO_OWNER" \
+              --head-repo-full-name "$PR_HEAD_REPO_FULL_NAME" \
+              --head-repo-id "$PR_HEAD_REPO_ID" \
+              --pr-author "$PR_AUTHOR" \
+              --actor "$ACTOR"
+          elif [[ "$EVENT_NAME" = "merge_group" ]]; then
+            node scripts/governance-check.mjs \
+              --workflow-sha "$WORKFLOW_SHA" \
+              --event-name "$EVENT_NAME" \
+              --event-action "$EVENT_ACTION" \
+              --repository "$REPOSITORY" \
+              --repository-id "$REPOSITORY_ID" \
+              --base "$MERGE_BASE_SHA" \
+              --base-ref "$MERGE_BASE_REF" \
+              --base-repo-full-name "$REPOSITORY" \
+              --base-repo-id "$REPOSITORY_ID" \
+              --head "$MERGE_HEAD_SHA" \
+              --head-ref "$MERGE_HEAD_REF" \
+              --head-repo-owner "$REPOSITORY_OWNER" \
+              --head-repo-full-name "$REPOSITORY" \
+              --head-repo-id "$REPOSITORY_ID" \
+              --actor "$ACTOR"
+          else
+            exit 1
+          fi

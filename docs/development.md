@@ -18,6 +18,11 @@ npm run dev
 ```
 
 The daemon reports its loopback URL and token file path, never the token value.
+The installed daemon and extension are a compatibility unit: `/v2/status`
+advertises the required API capabilities, and the extension refuses unsafe work
+with `DAEMON_UPGRADE_REQUIRED` when they are missing. Release validation includes
+the complete transitive compiled daemon ESM closure and every extension runtime
+file in the same archive.
 
 ## Extension
 
@@ -50,25 +55,44 @@ worktree whose app-generated branch name cannot use the required `cloga/`
 prefix, set `AGENT_POLICY_HEAD_REF=cloga/<remote-name>` while running verify.
 CI always validates the actual PR head ref.
 
-The first governance PR is a trust-on-first-use bootstrap: remote `main` cannot
-enforce a governance workflow it does not yet contain. Independently review
-that PR, then configure a ruleset requiring the Verify matrix and
-`Governance / Protected policy`. Protected changes need a fresh non-author
-maintainer `manual-governance` label after every synchronize event.
+This governance transition is a one-time trust bootstrap. The old BASE-only
+label gate cannot approve removal of its own obsolete blocking condition. After
+configured CI and review complete, the repository owner performs one
+administrative merge of this transition PR, immediately removes the old
+`Protected policy` branch-status requirement, and creates the active repository
+Ruleset `workflows` rule described in [security.md](security.md). In that
+Ruleset request, replace `<merge-commit-sha>` with the exact resulting merge
+commit on `main`; do not substitute the pre-merge HEAD. This is not a reusable
+bypass.
 
-The governance checker installs only the protected BASE lockfile, parses head
-workflow YAML as untrusted data with the pinned parser, and rejects aliases,
-anchors, custom tags, duplicate keys, explicit/quoted mapping keys, flow
-collections, folded values, local Actions, and non-SHA Action references. CI,
-Governance, and Release workflows must exactly match the protected AST
-allowlist.
+The rule requires `.github/workflows/governance-required.yml` from
+`cloga/copilot-im-gateway` (repository ID `1343812506`). The workflow has only
+`contents: read`; its first step validates the event and
+`github.workflow_sha`, and its pinned checkout uses that SHA. Dependencies and
+the checker therefore come only from the immutable Ruleset source commit. The
+event base, PR head, and merge-group head are fetched only as git objects and
+are never checked out or executed.
 
-For label/reopen events, the workflow accepts the current head only when an
-earlier protected opened/synchronize run created a successful
-`governance-head-<SHA>` artifact after verifying the expected `cloga` or
-`dependabot[bot]` actor. Artifact upload uses the pinned Actions runtime and
-works with Dependabot's read-only `GITHUB_TOKEN`; later events only need
-`actions: read`. The reader verifies the artifact's source run path, event,
-actor, and repository, then verifies the sole file binds the SHA, actor, and PR
-number. A failed synchronize from another writer cannot be made green by
-relabeling the pull request.
+Governance, packaging, release, and installer executables and their lint, test,
+coverage, and compiler configurations are immutable relative to
+`github.workflow_sha`. Every package command invoked by protected workflows is
+checked exactly, and npm `pre*`/`post*` hooks are denied for those commands. A
+dependency declaration or transitive lockfile change is pinned as part of the
+same trusted toolchain, except for the application version fields. A legitimate
+executable control-plane or dependency update requires an audited administrator
+bootstrap and Ruleset repin; ordinary runtime and documentation changes continue
+through the semantic checker without that operation.
+
+The trusted checker parses HEAD workflow YAML as untrusted data with the pinned
+parser and rejects aliases, anchors, custom tags, duplicate keys,
+explicit/quoted mapping keys, flow collections, folded values, local Actions,
+and non-SHA Action references. CI, Required governance, and Release workflows
+must exactly match the protected AST allowlist. Pull-request events enforce
+same-repository `cloga/*` or Dependabot branch, author, and actor identities.
+`merge_group/checks_requested` evaluates the synthetic queue head against
+`refs/heads/main` with the same semantic checks.
+
+Protected paths remain visible without an approval label. Every Ruleset or
+source-SHA update is an audited administrator action. Branch-protection status
+contexts may supplement the required workflow but are not its trust root.
+Agents must not modify live rulesets or add API automation that does so.

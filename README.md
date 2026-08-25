@@ -12,13 +12,13 @@ through the official GitHub Copilot SDK extension runtime.
 ## What is included
 
 - A durable daemon bound to `127.0.0.1` with bearer authentication.
-- Generic channel contracts, stable `channelId:conversationId` routing, durable
-  bindings, serial turn processing, deduplication, rate limiting, redaction,
+- Generic channel contracts, collision-safe account-aware route identities,
+  durable bindings, per-route FIFO processing, deduplication, rate limiting, redaction,
   bounded output, audit records, and expiring one-time approvals.
 - A WeChat iLink adapter with a protocol boundary that can use the real service
   or deterministic fixtures.
 - A project-scoped Copilot extension that joins the foreground session with
-  `joinSession()`, forwards approved inbound turns with `session.send()`, and
+  `joinSession()`, forwards approved inbound turns with `session.sendAndWait()`, and
   publishes safe final output through the daemon.
 - An experimental in-app Canvas for login, health, bindings, workspace aliases,
   pending approvals, and audit visibility.
@@ -46,7 +46,12 @@ TypeScript.
 3. Run the installer. It installs per-user under
    `%LOCALAPPDATA%\Programs\Copilot IM Gateway`, registers the extension under
    `%USERPROFILE%\.copilot\extensions\im-gateway`, and creates Start Menu
-   shortcuts. Reload extensions in GitHub Copilot App after installation.
+   shortcuts. During an upgrade it uses the local bearer token to request
+   authenticated v2 daemon shutdown and waits for the process and loopback port
+   to be released. If an older daemon or another listener cannot accept that
+   request, Setup leaves the existing installation and data untouched. Exit the
+   old Copilot IM Gateway and retry. Reload extensions in GitHub Copilot App
+   after installation.
 4. Open **Start Copilot IM Gateway** from the Start Menu. The installer does not
    configure persistent auto-start.
 5. Use **Gateway status** to open the unauthenticated local health endpoint.
@@ -77,7 +82,10 @@ The release contains compiled JavaScript, so consumers do not need TypeScript,
 development dependencies, or a local build. The installer runs
 `npm ci --omit=dev --ignore-scripts`, installs under
 `$HOME\.copilot\im-gateway`, and copies only the versioned extension files to
-`$HOME\.copilot\extensions\im-gateway`. It does not read or write credentials.
+`$HOME\.copilot\extensions\im-gateway`. It stops an installed daemon before
+replacement by reading its local bearer-token file without displaying or
+copying the credential. An upgrade aborts before replacement if authenticated
+v2 shutdown is unavailable; exit the old Copilot IM Gateway and retry.
 
 The first daemon start creates a local bearer token in the data directory with
 owner-only permissions where supported. Inspect the startup message for the

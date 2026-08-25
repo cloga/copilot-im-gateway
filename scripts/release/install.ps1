@@ -1,3 +1,9 @@
+param(
+    [string]$DataDirectory,
+    [string]$TokenFile,
+    [int]$Port = -1
+)
+
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
@@ -42,6 +48,23 @@ try {
     }
     finally {
         Pop-Location
+    }
+
+    $stopParameters = @{ InstallDirectory = $installDirectory }
+    if ($PSBoundParameters.ContainsKey("DataDirectory")) {
+        $stopParameters.DataDirectory = $DataDirectory
+    }
+    if ($PSBoundParameters.ContainsKey("TokenFile")) {
+        $stopParameters.TokenFile = $TokenFile
+    }
+    if ($PSBoundParameters.ContainsKey("Port")) {
+        $stopParameters.Port = $Port
+    }
+    try {
+        & (Join-Path $PSScriptRoot "stop-daemon.ps1") @stopParameters
+    }
+    catch {
+        throw "Upgrade aborted before replacing installed files. $($_.Exception.Message)"
     }
 
     if (Test-Path -LiteralPath $installDirectory) {

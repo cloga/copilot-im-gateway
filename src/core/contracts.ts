@@ -1,7 +1,70 @@
+import { createHash } from "node:crypto";
+
 export type ChannelId = string;
 export type ConversationId = string;
 export type SenderId = string;
-export type RouteKey = `${string}:${string}`;
+export type AccountId = string;
+export type RouteKey = string & { readonly __routeKey: unique symbol };
+
+export const localTenantId = "local" as const;
+export type TenantId = typeof localTenantId;
+
+export interface ChannelAccountIdentity {
+  tenantId: TenantId;
+  channelId: ChannelId;
+  accountId: AccountId;
+}
+
+export interface RouteIdentity extends ChannelAccountIdentity {
+  conversationId: ConversationId;
+  senderId: SenderId;
+}
+
+export function isWellFormedUnicode(value: string): boolean {
+  const intrinsic = (
+    String.prototype as {
+      isWellFormed?: (this: string) => boolean;
+    }
+  ).isWellFormed;
+  if (intrinsic !== undefined) {
+    return intrinsic.call(value);
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const current = value.charCodeAt(index);
+    if (current >= 0xd800 && current <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) {
+        return false;
+      }
+      index += 1;
+    } else if (current >= 0xdc00 && current <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function canonicalizeIdentityComponents(
+  components: readonly string[],
+): string {
+  if (components.some((component) => !isWellFormedUnicode(component))) {
+    throw new TypeError("Identity components must be well-formed Unicode.");
+  }
+  return components
+    .map((component) => `${Buffer.byteLength(component, "utf8")}:${component}`)
+    .join("");
+}
+
+export function toRouteKey(identity: RouteIdentity): RouteKey {
+  const canonical = canonicalizeIdentityComponents([
+    identity.tenantId,
+    identity.channelId,
+    identity.accountId,
+    identity.conversationId,
+    identity.senderId,
+  ]);
+  return createHash("sha256").update(canonical, "utf8").digest("hex") as RouteKey;
+}
 
 export interface InboundAttachment {
   id: string;
@@ -11,7 +74,9 @@ export interface InboundAttachment {
 }
 
 export interface ImInboundMessage {
+  tenantId: TenantId;
   channelId: ChannelId;
+  accountId: AccountId;
   conversationId: ConversationId;
   messageId: string;
   senderId: SenderId;
@@ -22,8 +87,11 @@ export interface ImInboundMessage {
 }
 
 export interface ImOutboundMessage {
+  tenantId: TenantId;
   channelId: ChannelId;
+  accountId: AccountId;
   conversationId: ConversationId;
+  senderId: SenderId;
   correlationId: string;
   text: string;
   format: "plain";
@@ -39,8 +107,32 @@ export type ChannelHealth =
   | { state: "failed"; since: string; errorCode: string };
 
 export interface ChannelContext {
-  onInbound(message: ImInboundMessage): Promise<void>;
+  onInbound(envelope: MinimalInboundEnvelope): Promise<void>;
   onHealth(channelId: ChannelId, health: ChannelHealth): Promise<void>;
+}
+
+export interface MinimalInboundEnvelope {
+  identity: RouteIdentity;
+  messageId: string;
+  receivedAt: string;
+  materialize(): Promise<ImInboundMessage>;
+}
+
+export function deferInboundMessage(
+  message: ImInboundMessage,
+): MinimalInboundEnvelope {
+  return {
+    identity: {
+      tenantId: message.tenantId,
+      channelId: message.channelId,
+      accountId: message.accountId,
+      conversationId: message.conversationId,
+      senderId: message.senderId,
+    },
+    messageId: message.messageId,
+    receivedAt: message.receivedAt,
+    materialize: async () => message,
+  };
 }
 
 export interface ImChannelAdapter {
@@ -84,17 +176,13 @@ export function isLoginCapableChannel(
 
 export interface SessionBinding {
   routeKey: RouteKey;
+  tenantId: TenantId;
   channelId: ChannelId;
+  accountId: AccountId;
   conversationId: ConversationId;
+  senderId: SenderId;
   sessionId: string;
   workspaceAlias: string;
   createdAt: string;
   updatedAt: string;
-}
-
-export function toRouteKey(
-  channelId: ChannelId,
-  conversationId: ConversationId,
-): RouteKey {
-  return `${channelId}:${conversationId}`;
 }

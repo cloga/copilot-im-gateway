@@ -88,6 +88,23 @@
     "tsconfig.json",
     "vitest.config.ts"
   ],
+  "trustedExecutablePaths": [
+    "eslint.config.mjs",
+    "scripts/coverage-check.mjs",
+    "scripts/governance-check.mjs",
+    "scripts/install-user-extension.mjs",
+    "scripts/installer/**",
+    "scripts/package-release.mjs",
+    "scripts/path-policy.mjs",
+    "scripts/policy-check.mjs",
+    "scripts/release/**",
+    "scripts/validate-release.mjs",
+    "scripts/verify-release.mjs",
+    "scripts/workflow-policy.mjs",
+    "tsconfig.build.json",
+    "tsconfig.json",
+    "vitest.config.ts"
+  ],
   "runtimeSecurityPaths": [
     ".github/extensions/im-gateway/**",
     "src/**"

@@ -12,7 +12,9 @@ import {
 const connection = resolveGatewayConnection();
 const client = new GatewayClient(connection);
 /** @type {{
+ *   tenantId:string,
  *   channelId:string,
+ *   accountId:string,
  *   conversationId:string,
  *   senderId:string,
  *   sessionId:string,
@@ -47,6 +49,7 @@ const joinedSession = await joinSession({
   onPermissionRequest,
 });
 session = joinedSession;
+await client.ensureCompatible();
 
 await joinedSession.log(
   `IM Gateway connected to ${connection.baseUrl}. Open the IM Gateway canvas to configure it.`,

@@ -1,0 +1,19 @@
+{
+  "name": "weixin-online-v1",
+  "endpoints": {
+    "loginQr": "/ilink/bot/get_bot_qrcode?bot_type=3",
+    "loginStatus": "/ilink/bot/get_qrcode_status?qrcode=qr-id",
+    "updates": "/ilink/bot/getupdates",
+    "send": "/ilink/bot/sendmessage"
+  },
+  "headers": {
+    "authorizationType": "ilink_bot_token",
+    "appId": "bot",
+    "clientVersion": "256"
+  },
+  "updates": {
+    "get_updates_buf": "",
+    "longpolling_timeout_ms": 0,
+    "msgs": []
+  }
+}

@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import {
   changedPaths,
   matchesAny,
@@ -20,18 +21,50 @@ const requiredVerifyCommands = [
 ];
 const protectedDefaultBranch = "main";
 const protectedRepositoryFullName = "cloga/copilot-im-gateway";
+const protectedRepositoryId = "1343812506";
+const protectedBranchAccount = "cloga";
+const protectedBranchPrefix = "cloga/";
+const protectedAutomationAccount = "dependabot[bot]";
+const protectedAutomationPrefix = "dependabot/";
+const pullRequestActions = new Set([
+  "opened",
+  "synchronize",
+  "reopened",
+  "ready_for_review",
+  "edited",
+]);
+
+/**
+ * @typedef {{
+ *   workflowSha: string,
+ *   eventName: string,
+ *   eventAction: string,
+ *   repositoryFullName: string,
+ *   repositoryId: string,
+ *   baseSha: string,
+ *   baseRef: string,
+ *   baseRepoFullName: string,
+ *   baseRepoId: string,
+ *   headSha: string,
+ *   headRef: string,
+ *   headRepoOwner: string,
+ *   headRepoFullName: string,
+ *   headRepoId: string,
+ *   prAuthor: string,
+ *   actor: string,
+ * }} TrustContext
+ */
 
 /**
  * @param {{
  *   policy: Record<string, unknown>,
  *   changes: Array<{status: string, paths: string[]}>,
- *   headRef: string,
- *   identity: {baseRef:string, baseRepoFullName:string, headRepoOwner:string, headRepoFullName:string, prAuthor:string, eventAction:string, eventActor:string, headProvenanceVerified:boolean},
- *   manualGovernanceApproved: boolean,
+ *   trust: TrustContext,
  *   readBase: (path: string) => string | undefined,
+ *   readTrusted: (path: string) => string | undefined,
  *   readHead: (path: string) => string | undefined,
+ *   listTrustedFiles: (path: string) => string[],
  *   listHeadFiles: (path: string) => string[],
- *   enforceManualApproval?: boolean,
  * }} input
  */
 export function evaluatePolicy(input) {
@@ -47,6 +80,10 @@ export function evaluatePolicy(input) {
     input.policy.protectedPaths,
     "protectedPaths",
   );
+  const trustedExecutablePaths = requireStringArray(
+    input.policy.trustedExecutablePaths,
+    "trustedExecutablePaths",
+  );
   const runtimeSecurityPaths = requireStringArray(
     input.policy.runtimeSecurityPaths,
     "runtimeSecurityPaths",
@@ -57,7 +94,7 @@ export function evaluatePolicy(input) {
   );
   const paths = changedPaths(input.changes);
 
-  validatePullRequestIdentity(input.policy, input.headRef, input.identity);
+  validateTrustContext(input.policy, input.trust);
   for (const path of paths) {
     assert(
       matchesAny(path, allowedPaths),
@@ -103,18 +140,17 @@ export function evaluatePolicy(input) {
   const protectedChanges = paths.filter((path) =>
     matchesAny(path, protectedPaths),
   );
-  if (
-    input.enforceManualApproval !== false &&
-    protectedChanges.length > 0 &&
-    !input.manualGovernanceApproved
-  ) {
-    throw new Error(
-      `protected changes require a fresh manual-governance approval: ${protectedChanges.join(", ")}`,
-    );
-  }
 
   validateCoverageBaseline(input.readBase, input.readHead);
   validateQualityGate(input.readHead);
+  validateTrustedToolchain(input.readTrusted, input.readHead);
+  validateTrustedExecutables(
+    trustedExecutablePaths,
+    input.readTrusted,
+    input.readHead,
+    input.listTrustedFiles,
+    input.listHeadFiles,
+  );
   validateWorkflows(input.listHeadFiles, input.readHead);
   validateContentPolicy(input.policy, input.listHeadFiles, input.readHead);
   validateArchitecture(input.policy, input.readHead);
@@ -127,10 +163,9 @@ export function evaluatePolicy(input) {
 
 /**
  * @param {Record<string, unknown>} policy
- * @param {string} headRef
- * @param {{baseRef:string, baseRepoFullName:string, headRepoOwner:string, headRepoFullName:string, prAuthor:string, eventAction:string, eventActor:string, headProvenanceVerified:boolean}} identity
+ * @param {TrustContext} trust
  */
-export function validatePullRequestIdentity(policy, headRef, identity) {
+export function validateTrustContext(policy, trust) {
   const defaultBranch = requireString(policy.defaultBranch, "defaultBranch");
   const repositoryFullName = requireString(
     policy.repositoryFullName,
@@ -158,59 +193,113 @@ export function validatePullRequestIdentity(policy, headRef, identity) {
     `policy repository must be ${protectedRepositoryFullName}`,
   );
   assert(
-    identity.baseRef === protectedDefaultBranch,
-    `pull request base branch must be ${protectedDefaultBranch}`,
+    branchAccount === protectedBranchAccount &&
+      branchAccountPrefix === protectedBranchPrefix,
+    "policy account branch identity is invalid",
   );
   assert(
-    identity.baseRepoFullName === protectedRepositoryFullName,
-    "pull request base must be the protected repository",
+    automationAccount === protectedAutomationAccount &&
+      automationBranchPrefixes.length === 1 &&
+      automationBranchPrefixes[0] === protectedAutomationPrefix,
+    "policy automation branch identity is invalid",
+  );
+  assertFullSha(trust.workflowSha, "workflow SHA");
+  assertFullSha(trust.baseSha, "base");
+  assertFullSha(trust.headSha, "head");
+  assert(
+    trust.repositoryFullName === protectedRepositoryFullName,
+    "event repository must be the protected repository",
   );
   assert(
-    identity.headRepoFullName === repositoryFullName &&
-      identity.headRepoOwner === branchAccount,
-    "pull request head must come from the protected repository",
+    trust.repositoryId === protectedRepositoryId,
+    "event repository ID must be the protected repository ID",
   );
-  if (automationBranchPrefixes.some((prefix) => headRef.startsWith(prefix))) {
+  assert(
+    trust.baseRepoFullName === protectedRepositoryFullName &&
+      trust.baseRepoId === protectedRepositoryId,
+    "event base must be the protected repository",
+  );
+  assert(
+    trust.headRepoFullName === protectedRepositoryFullName &&
+      trust.headRepoId === protectedRepositoryId &&
+      trust.headRepoOwner === protectedBranchAccount,
+    "event head must come from the protected repository",
+  );
+
+  if (trust.eventName === "pull_request") {
     assert(
-      identity.prAuthor === automationAccount,
-      "automation branches require the protected automation author",
+      pullRequestActions.has(trust.eventAction),
+      "pull request action is not protected",
     );
-    validateAuthoringActor(identity, automationAccount);
+    validatePullRequestIdentity(
+      trust,
+      branchAccountPrefix,
+      automationBranchPrefixes,
+      branchAccount,
+      automationAccount,
+    );
     return;
   }
   assert(
-    headRef === defaultBranch || headRef.startsWith(branchAccountPrefix),
-    `head branch must be ${defaultBranch} or start with ${branchAccountPrefix}`,
+    trust.eventName === "merge_group",
+    "event must be pull_request or merge_group",
   );
   assert(
-    identity.prAuthor === branchAccount,
-    "account branch author must match the protected account",
+    trust.eventAction === "checks_requested",
+    "merge group action must be checks_requested",
   );
-  validateAuthoringActor(identity, branchAccount);
+  assert(
+    trust.baseRef === `refs/heads/${protectedDefaultBranch}`,
+    `merge group base ref must be refs/heads/${protectedDefaultBranch}`,
+  );
 }
 
 /**
- * Label and reopen events may be performed by maintainers. Events that create
- * or update the head must run as the protected branch author.
- *
- * @param {{eventAction:string,eventActor:string,headProvenanceVerified:boolean}} identity
- * @param {string} expectedActor
+ * @param {TrustContext} trust
+ * @param {string} branchAccountPrefix
+ * @param {string[]} automationBranchPrefixes
+ * @param {string} branchAccount
+ * @param {string} automationAccount
  */
-function validateAuthoringActor(identity, expectedActor) {
+function validatePullRequestIdentity(
+  trust,
+  branchAccountPrefix,
+  automationBranchPrefixes,
+  branchAccount,
+  automationAccount,
+) {
+  assert(
+    trust.baseRef === protectedDefaultBranch,
+    `pull request base branch must be ${protectedDefaultBranch}`,
+  );
   if (
-    identity.eventAction === "opened" ||
-    identity.eventAction === "synchronize"
+    automationBranchPrefixes.some(
+      (prefix) => trust.headRef.startsWith(prefix) && trust.headRef !== prefix,
+    )
   ) {
     assert(
-      identity.eventActor === expectedActor,
-      "head-authoring event actor must match the protected account",
+      trust.prAuthor === automationAccount,
+      "automation branches require the protected automation author",
     );
-  } else {
     assert(
-      identity.headProvenanceVerified,
-      "current head SHA lacks trusted authoring-event provenance",
+      trust.actor === automationAccount,
+      "automation branches require the protected automation actor",
     );
+    return;
   }
+  assert(
+    trust.headRef.startsWith(branchAccountPrefix) &&
+      trust.headRef !== branchAccountPrefix,
+    `head branch must start with ${branchAccountPrefix}`,
+  );
+  assert(
+    trust.prAuthor === branchAccount,
+    "account branch author must match the protected account",
+  );
+  assert(
+    trust.actor === branchAccount,
+    "account branch actor must match the protected account",
+  );
 }
 
 /**
@@ -257,17 +346,130 @@ export function validateQualityGate(readHead) {
   );
   const protectedScripts = {
     "audit:check": "npm audit --audit-level=high",
+    build: "tsc -p tsconfig.build.json",
     "coverage:check": "node scripts/coverage-check.mjs",
+    lint: "eslint .",
     "policy:check": "node scripts/policy-check.mjs",
+    "release:installer":
+      "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/installer/build-windows-installer.ps1",
+    "release:installer:smoke":
+      "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/installer/smoke-windows-installer.ps1",
+    "release:package": "node scripts/package-release.mjs",
+    "release:validate": "node scripts/validate-release.mjs",
     "release:verify": "node scripts/verify-release.mjs",
     "test:coverage": "vitest run --coverage",
+    typecheck: "tsc --noEmit",
+    verify: requiredVerifyCommands.join(" && "),
   };
   for (const [name, expected] of Object.entries(protectedScripts)) {
     assert(
       scripts[name] === expected,
       `protected package script changed: ${name}`,
     );
+    for (const lifecycle of [`pre${name}`, `post${name}`]) {
+      assert(
+        !(lifecycle in scripts),
+        `protected package lifecycle hook is denied: ${lifecycle}`,
+      );
+    }
   }
+}
+
+/**
+ * @param {string[]} patterns
+ * @param {(path: string) => string | undefined} readTrusted
+ * @param {(path: string) => string | undefined} readHead
+ * @param {(path: string) => string[]} listTrustedFiles
+ * @param {(path: string) => string[]} listHeadFiles
+ */
+export function validateTrustedExecutables(
+  patterns,
+  readTrusted,
+  readHead,
+  listTrustedFiles,
+  listHeadFiles,
+) {
+  assert(patterns.length > 0, "trustedExecutablePaths must not be empty");
+  const paths = new Set([
+    ...listTrustedFiles(""),
+    ...listHeadFiles(""),
+  ]);
+  for (const path of [...paths].sort()) {
+    if (!matchesAny(path, patterns)) {
+      continue;
+    }
+    const trusted = readTrusted(path);
+    const head = readHead(path);
+    assert(
+      trusted !== undefined && head !== undefined && head === trusted,
+      `trusted executable differs from workflow SHA: ${path}`,
+    );
+  }
+  for (const pattern of patterns) {
+    assert(
+      [...paths].some((path) => matchesAny(path, [pattern])),
+      `trusted executable pattern matches no files: ${pattern}`,
+    );
+  }
+}
+
+/**
+ * @param {(path: string) => string | undefined} readTrusted
+ * @param {(path: string) => string | undefined} readHead
+ */
+export function validateTrustedToolchain(readTrusted, readHead) {
+  const trustedPackage = parseJsonRecord(
+    readTrusted("package.json"),
+    "trusted package.json",
+  );
+  const headPackage = parseJsonRecord(readHead("package.json"), "package.json");
+  for (const field of [
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+  ]) {
+    assert(
+      isDeepStrictEqual(trustedPackage[field], headPackage[field]),
+      `dependency declarations differ from workflow SHA: ${field}`,
+    );
+  }
+
+  const trustedLock = normalizePackageLock(
+    parseJsonRecord(
+      readTrusted("package-lock.json"),
+      "trusted package-lock.json",
+    ),
+  );
+  const headLock = normalizePackageLock(
+    parseJsonRecord(readHead("package-lock.json"), "package-lock.json"),
+  );
+  assert(
+    isDeepStrictEqual(trustedLock, headLock),
+    "package-lock.json differs from workflow SHA",
+  );
+}
+
+/** @param {Record<string, unknown>} lock */
+function normalizePackageLock(lock) {
+  const normalized = structuredClone(lock);
+  delete normalized.version;
+  const packages = requireRecord(
+    normalized.packages,
+    "package-lock.json packages",
+  );
+  const root = requireRecord(packages[""], "package-lock.json root package");
+  delete root.version;
+  return normalized;
+}
+
+/**
+ * @param {string | undefined} source
+ * @param {string} label
+ */
+function parseJsonRecord(source, label) {
+  assert(source !== undefined, `${label} is missing`);
+  return requireRecord(JSON.parse(source), label);
 }
 
 /**
@@ -349,42 +551,45 @@ export function validateArchitecture(policy, readHead) {
 
 /**
  * @param {{
- *   base: string,
- *   baseRef: string,
- *   baseRepoFullName: string,
- *   head: string,
- *   headRef: string,
- *   identity: {baseRef:string, baseRepoFullName:string, headRepoOwner:string, headRepoFullName:string, prAuthor:string, eventAction:string, eventActor:string, headProvenanceVerified:boolean},
- *   manualGovernanceApproved: boolean,
+ *   trust: TrustContext,
  * }} input
  */
 export function evaluateGovernance(input) {
-  assertFullCommit(input.base, "base");
-  assertFullCommit(input.head, "head");
+  const { trust } = input;
+  assertFullCommit(trust.workflowSha, "workflow SHA");
+  assertFullCommit(trust.baseSha, "base");
+  assertFullCommit(trust.headSha, "head");
   assert(
-    git(["rev-parse", "FETCH_HEAD"], false).stdout.trim() === input.head,
-    "fetched pull request head does not match the event head SHA",
+    git(["rev-parse", "HEAD"]).stdout.trim() === trust.workflowSha,
+    "checked out source does not match the workflow SHA",
+  );
+  assert(
+    git(["rev-parse", "FETCH_HEAD"], false).stdout.trim() === trust.headSha,
+    "fetched untrusted head does not match the event head SHA",
   );
   const policy = requireRecord(
-    JSON.parse(readAt(input.base, ".github/agent-policy.json")),
-    "base policy",
+    JSON.parse(readAt(trust.workflowSha, ".github/agent-policy.json")),
+    "trusted workflow policy",
   );
+  validateTrustContext(policy, trust);
   return evaluatePolicy({
     policy,
     changes: parseNameStatus(
-      git(["diff", "--name-status", "--find-renames", input.base, input.head])
-        .stdout,
+      git([
+        "diff",
+        "--name-status",
+        "--find-renames",
+        trust.baseSha,
+        trust.headSha,
+        "--",
+      ]).stdout,
     ),
-    headRef: input.headRef,
-    identity: {
-      ...input.identity,
-      baseRef: input.baseRef,
-      baseRepoFullName: input.baseRepoFullName,
-    },
-    manualGovernanceApproved: input.manualGovernanceApproved,
-    readBase: (path) => readAtOptional(input.base, path),
-    readHead: (path) => readAtOptional(input.head, path),
-    listHeadFiles: (directory) => listAt(input.head, directory),
+    trust,
+    readBase: (path) => readAtOptional(trust.baseSha, path),
+    readTrusted: (path) => readAtOptional(trust.workflowSha, path),
+    readHead: (path) => readAtOptional(trust.headSha, path),
+    listTrustedFiles: (directory) => listAt(trust.workflowSha, directory),
+    listHeadFiles: (directory) => listAt(trust.headSha, directory),
   });
 }
 
@@ -412,11 +617,16 @@ function listAt(ref, directory) {
 
 /** @param {string} ref @param {string} label */
 function assertFullCommit(ref, label) {
-  assert(/^[a-f0-9]{40}$/u.test(ref), `${label} must be a full commit SHA`);
+  assertFullSha(ref, label);
   assert(
     git(["cat-file", "-e", `${ref}^{commit}`], false).status === 0,
     `${label} commit is missing`,
   );
+}
+
+/** @param {string} value @param {string} label */
+function assertFullSha(value, label) {
+  assert(/^[a-f0-9]{40}$/u.test(value), `${label} must be a full commit SHA`);
 }
 
 /** @param {string[]} args @param {boolean} [required] */
@@ -482,6 +692,24 @@ function assert(condition, message) {
 /** @param {string[]} argv */
 function parseArgs(argv) {
   const values = new Map();
+  const allowed = new Set([
+    "workflow-sha",
+    "event-name",
+    "event-action",
+    "repository",
+    "repository-id",
+    "base",
+    "base-ref",
+    "base-repo-full-name",
+    "base-repo-id",
+    "head",
+    "head-ref",
+    "head-repo-owner",
+    "head-repo-full-name",
+    "head-repo-id",
+    "pr-author",
+    "actor",
+  ]);
   for (let index = 0; index < argv.length; index += 2) {
     const key = argv[index];
     const value = argv[index + 1];
@@ -489,27 +717,32 @@ function parseArgs(argv) {
       typeof key === "string" && key.startsWith("--") && value,
       "invalid governance arguments",
     );
-    values.set(key.slice(2), value);
+    const name = key.slice(2);
+    assert(
+      allowed.has(name) && !values.has(name),
+      "invalid governance arguments",
+    );
+    values.set(name, value);
   }
   return {
-    base: values.get("base") ?? "",
-    baseRef: values.get("base-ref") ?? "",
-    baseRepoFullName: values.get("base-repo-full-name") ?? "",
-    head: values.get("head") ?? "",
-    headRef: values.get("head-ref") ?? "",
-    identity: {
+    trust: {
+      workflowSha: values.get("workflow-sha") ?? "",
+      eventName: values.get("event-name") ?? "",
+      eventAction: values.get("event-action") ?? "",
+      repositoryFullName: values.get("repository") ?? "",
+      repositoryId: values.get("repository-id") ?? "",
+      baseSha: values.get("base") ?? "",
       baseRef: values.get("base-ref") ?? "",
       baseRepoFullName: values.get("base-repo-full-name") ?? "",
+      baseRepoId: values.get("base-repo-id") ?? "",
+      headSha: values.get("head") ?? "",
+      headRef: values.get("head-ref") ?? "",
       headRepoOwner: values.get("head-repo-owner") ?? "",
       headRepoFullName: values.get("head-repo-full-name") ?? "",
+      headRepoId: values.get("head-repo-id") ?? "",
       prAuthor: values.get("pr-author") ?? "",
-      eventAction: values.get("event-action") ?? "",
-      eventActor: values.get("event-actor") ?? "",
-      headProvenanceVerified:
-        values.get("head-provenance-verified") === "true",
+      actor: values.get("actor") ?? "",
     },
-    manualGovernanceApproved:
-      values.get("manual-governance-approved") === "true",
   };
 }
 
