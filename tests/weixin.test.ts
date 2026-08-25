@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -15,6 +15,7 @@ import {
   type WeixinUpdates,
 } from "../src/channels/weixin/protocol.js";
 import { GatewayStore } from "../src/daemon/store.js";
+import { GatewayError, gatewayErrorCodes } from "../src/core/errors.js";
 
 const temporaryDirectories: string[] = [];
 
@@ -93,6 +94,91 @@ describe("FetchWeixinProtocolClient", () => {
     };
     expect(sendBody.msg.context_token).toBe("context");
     expect(sendBody.msg.item_list[0]?.type).toBe(1);
+  });
+
+  it("pins ONLINE compatibility and retains empty cursor/timeout updates", async () => {
+    const fixture = JSON.parse(
+      readFileSync(
+        new URL("./fixtures/weixin-online-v1.json", import.meta.url),
+        "utf8",
+      ),
+    ) as {
+      name: string;
+      endpoints: { updates: string };
+      updates: Record<string, unknown>;
+    };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(fixture.updates), { status: 200 }),
+    );
+    const client = new FetchWeixinProtocolClient({
+      loginBaseUrl: "https://fixture.example.test",
+      fetch: fetchMock,
+    });
+    const updates = await client.getUpdates({
+      credentials: {
+        botToken: "token",
+        botId: "bot",
+        baseUrl: "https://fixture.example.test",
+      },
+      cursor: "previous-cursor",
+      desiredTimeoutMs: 12_000,
+      signal: new AbortController().signal,
+    });
+    expect(fixture.name).toBe("weixin-online-v1");
+    expect(String(fetchMock.mock.calls[0]?.[0])).toContain(
+      fixture.endpoints.updates,
+    );
+    expect(updates.cursor).toBe("previous-cursor");
+    expect(updates.longPollingTimeoutMs).toBe(12_000);
+  });
+
+  it("treats protocol and caller abort timeouts as empty polls", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn<typeof fetch>(
+      async (_url, init) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener(
+            "abort",
+            () => reject(new DOMException("timed out", "AbortError")),
+            { once: true },
+          );
+        }),
+    );
+    const client = new FetchWeixinProtocolClient({
+      loginBaseUrl: "https://fixture.example.test",
+      fetch: fetchMock,
+    });
+    const credentials = {
+      botToken: "token",
+      botId: "bot",
+      baseUrl: "https://fixture.example.test",
+    };
+    const timed = client.getUpdates({
+      credentials,
+      cursor: "cursor",
+      desiredTimeoutMs: 1_000,
+      signal: new AbortController().signal,
+    });
+    await vi.advanceTimersByTimeAsync(6_000);
+    await expect(timed).resolves.toMatchObject({
+      messages: [],
+      cursor: "cursor",
+      longPollingTimeoutMs: 1_000,
+    });
+
+    const controller = new AbortController();
+    const aborted = client.getUpdates({
+      credentials,
+      cursor: "cursor",
+      desiredTimeoutMs: 2_000,
+      signal: controller.signal,
+    });
+    controller.abort();
+    await expect(aborted).resolves.toMatchObject({
+      messages: [],
+      cursor: "cursor",
+    });
+    vi.useRealTimers();
   });
 });
 
@@ -181,6 +267,297 @@ class FixtureWeixinProtocol implements WeixinProtocolClient {
 }
 
 describe("WeixinAdapter", () => {
+  it("invalidates an in-flight login confirmation during shutdown", async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "copilot-im-stop-race-"));
+    temporaryDirectories.push(directory);
+    const store = new GatewayStore(path.join(directory, "gateway.sqlite"));
+    store.setActiveChannelAccount(
+      {
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot-old",
+      },
+      {
+        botToken: "old-token",
+        botId: "bot-old",
+        baseUrl: "https://old.example.test",
+      } satisfies WeixinCredentials,
+      "2026-08-24T00:00:00.000Z",
+    );
+    let resolveStatus:
+      | ((status: WeixinLoginStatus) => void)
+      | undefined;
+    const statusGate = new Promise<WeixinLoginStatus>((resolve) => {
+      resolveStatus = resolve;
+    });
+    const polledAccounts: string[] = [];
+    const protocol: WeixinProtocolClient = {
+      getLoginQr: async () => ({
+        id: "qr",
+        url: "https://example.test/qr",
+        pollingBaseUrl: "https://example.test",
+      }),
+      pollLoginStatus: async () => statusGate,
+      getUpdates: async (input) => {
+        polledAccounts.push(input.credentials.botId);
+        await new Promise<void>((resolve) => {
+          input.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return {
+          messages: [],
+          cursor: input.cursor,
+          longPollingTimeoutMs: 35_000,
+        };
+      },
+      sendText: async () => undefined,
+    };
+    const adapter = new WeixinAdapter({ store, protocol });
+    await adapter.start({
+      onInbound: async () => undefined,
+      onHealth: async () => undefined,
+    });
+    await adapter.startLogin();
+    const confirmation = adapter.pollLogin();
+    await adapter.stop();
+    resolveStatus?.({
+      status: "confirmed",
+      bot_token: "new-token",
+      ilink_bot_id: "bot-new",
+      baseurl: "https://new.example.test",
+    });
+    await expect(confirmation).resolves.toEqual({ state: "not_started" });
+    expect(polledAccounts).toEqual(["bot-old"]);
+    expect(adapter.getHealth()).toEqual({ state: "stopped" });
+    store.close();
+  });
+
+  it("discards a stale QR result after a newer login generation starts", async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "copilot-im-login-race-"));
+    temporaryDirectories.push(directory);
+    const store = new GatewayStore(path.join(directory, "gateway.sqlite"));
+    store.setActiveChannelAccount(
+      {
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot-old",
+      },
+      {
+        botToken: "old-token",
+        botId: "bot-old",
+        baseUrl: "https://old.example.test",
+      } satisfies WeixinCredentials,
+      "2026-08-24T00:00:00.000Z",
+    );
+    let qrGeneration = 0;
+    let resolveStatus:
+      | ((status: WeixinLoginStatus) => void)
+      | undefined;
+    const statusGate = new Promise<WeixinLoginStatus>((resolve) => {
+      resolveStatus = resolve;
+    });
+    const protocol: WeixinProtocolClient = {
+      getLoginQr: async () => {
+        qrGeneration += 1;
+        return {
+          id: `qr-${qrGeneration}`,
+          url: `https://example.test/qr-${qrGeneration}`,
+          pollingBaseUrl: "https://example.test",
+        };
+      },
+      pollLoginStatus: async () => statusGate,
+      getUpdates: async (input) => {
+        await new Promise<void>((resolve) => {
+          input.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return {
+          messages: [],
+          cursor: input.cursor,
+          longPollingTimeoutMs: 35_000,
+        };
+      },
+      sendText: async () => undefined,
+    };
+    const adapter = new WeixinAdapter({ store, protocol });
+    await adapter.start({
+      onInbound: async () => undefined,
+      onHealth: async () => undefined,
+    });
+    await adapter.startLogin();
+    const stalePoll = adapter.pollLogin();
+    await adapter.startLogin();
+    resolveStatus?.({
+      status: "confirmed",
+      bot_token: "stale-token",
+      ilink_bot_id: "bot-stale",
+      baseurl: "https://stale.example.test",
+    });
+    await expect(stalePoll).resolves.toEqual({ state: "not_started" });
+    expect(
+      store.getActiveChannelAccount<WeixinCredentials>("local", "weixin-main")
+        ?.identity.accountId,
+    ).toBe("bot-old");
+
+    await adapter.stop();
+    store.close();
+  });
+
+  it("stops the old account poll before activating a replacement account", async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "copilot-im-relogin-"));
+    temporaryDirectories.push(directory);
+    const store = new GatewayStore(path.join(directory, "gateway.sqlite"));
+    store.setActiveChannelAccount(
+      {
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot-old",
+      },
+      {
+        botToken: "old-token",
+        botId: "bot-old",
+        baseUrl: "https://old.example.test",
+      } satisfies WeixinCredentials,
+      "2026-08-24T00:00:00.000Z",
+    );
+    const polledAccounts: string[] = [];
+    const protocol: WeixinProtocolClient = {
+      getLoginQr: async () => ({
+        id: "qr",
+        url: "https://example.test/qr",
+        pollingBaseUrl: "https://example.test",
+      }),
+      pollLoginStatus: async () => ({
+        status: "confirmed",
+        bot_token: "new-token",
+        ilink_bot_id: "bot-new",
+        baseurl: "https://new.example.test",
+      }),
+      getUpdates: async (input) => {
+        polledAccounts.push(input.credentials.botId);
+        await new Promise<void>((resolve) => {
+          input.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return {
+          messages: [],
+          cursor: input.cursor,
+          longPollingTimeoutMs: 35_000,
+        };
+      },
+      sendText: async () => undefined,
+    };
+    const adapter = new WeixinAdapter({ store, protocol });
+    await adapter.start({
+      onInbound: async () => undefined,
+      onHealth: async () => undefined,
+    });
+    await vi.waitFor(() => expect(polledAccounts).toEqual(["bot-old"]));
+    await adapter.startLogin();
+    await adapter.pollLogin();
+    await vi.waitFor(() =>
+      expect(polledAccounts).toEqual(["bot-old", "bot-new"]),
+    );
+
+    await adapter.stop();
+    store.close();
+  });
+
+  it("advances the cursor after a durable terminal admission rejection", async () => {
+    vi.useFakeTimers();
+    const directory = mkdtempSync(path.join(os.tmpdir(), "copilot-im-drop-"));
+    temporaryDirectories.push(directory);
+    const store = new GatewayStore(path.join(directory, "gateway.sqlite"));
+    store.setActiveChannelAccount(
+      {
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot-id",
+      },
+      {
+        botToken: "bot-token",
+        botId: "bot-id",
+        baseUrl: "https://api.example.test",
+      } satisfies WeixinCredentials,
+      "2026-08-24T00:00:00.000Z",
+    );
+    let delivered = false;
+    const protocol: WeixinProtocolClient = {
+      getLoginQr: async () => ({
+        id: "qr",
+        url: "https://example.test/qr",
+        pollingBaseUrl: "https://example.test",
+      }),
+      pollLoginStatus: async () => ({ status: "wait" }),
+      getUpdates: async (input) => {
+        if (!delivered) {
+          delivered = true;
+          return {
+            messages: [
+              {
+                message_id: 1,
+                from_user_id: "sender",
+                message_type: 1,
+                context_token: "context",
+                item_list: [{ type: 1, text_item: { text: "denied" } }],
+              },
+            ],
+            cursor: "cursor-after-denial",
+            longPollingTimeoutMs: 35_000,
+          };
+        }
+        await new Promise<void>((resolve) => {
+          input.signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        return {
+          messages: [],
+          cursor: input.cursor,
+          longPollingTimeoutMs: 35_000,
+        };
+      },
+      sendText: async () => undefined,
+    };
+    const adapter = new WeixinAdapter({ store, protocol });
+    await adapter.start({
+      onInbound: async () => {
+        throw new GatewayError({
+          code: gatewayErrorCodes.senderDenied,
+          message: "denied",
+          status: 403,
+        });
+      },
+      onHealth: async () => undefined,
+    });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(
+      store.getChannelState<string>(
+        {
+          tenantId: "local",
+          channelId: "weixin-main",
+          accountId: "bot-id",
+        },
+        "updates-cursor",
+      ),
+    ).toBe("cursor-after-denial");
+    await adapter.stop();
+    store.close();
+    vi.useRealTimers();
+  });
+
+  it("isolates cursor and context state by negotiated account", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "copilot-im-state-"));
+    temporaryDirectories.push(directory);
+    const store = new GatewayStore(path.join(directory, "gateway.sqlite"));
+    const first = {
+      tenantId: "local" as const,
+      channelId: "weixin-main",
+      accountId: "bot-a",
+    };
+    const second = { ...first, accountId: "bot-b" };
+    store.setChannelState(first, "updates-cursor", "cursor-a", new Date().toISOString());
+    store.setChannelState(second, "updates-cursor", "cursor-b", new Date().toISOString());
+    expect(store.getChannelState(first, "updates-cursor")).toBe("cursor-a");
+    expect(store.getChannelState(second, "updates-cursor")).toBe("cursor-b");
+    store.close();
+  });
+
   it("persists login, normalizes inbound messages, and echoes context tokens", async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "copilot-im-weixin-"));
     temporaryDirectories.push(directory);
@@ -189,7 +566,7 @@ describe("WeixinAdapter", () => {
     let cleanupAdapter: WeixinAdapter | undefined;
     const inbound = new Promise<ImInboundMessage>((resolve) => {
       const context: ChannelContext = {
-        onInbound: async (message) => resolve(message),
+        onInbound: async (envelope) => resolve(await envelope.materialize()),
         onHealth: async () => undefined,
       };
       const adapter = new WeixinAdapter({ store, protocol });
@@ -206,8 +583,11 @@ describe("WeixinAdapter", () => {
       "https://fixture-login.example.test",
     ]);
     await cleanupAdapter?.send({
+      tenantId: "local",
       channelId: "weixin-main",
+      accountId: "bot-id",
       conversationId: "sender",
+      senderId: "sender",
       correlationId: "message-42",
       text: "response",
       format: "plain",
@@ -229,9 +609,12 @@ describe("WeixinAdapter", () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "copilot-im-cursor-"));
     temporaryDirectories.push(directory);
     const store = new GatewayStore(path.join(directory, "gateway.sqlite"));
-    store.setChannelState(
-      "weixin-main",
-      "credentials",
+    store.setActiveChannelAccount(
+      {
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot-id",
+      },
       {
         botToken: "bot-token",
         botId: "bot-id",
@@ -289,7 +672,14 @@ describe("WeixinAdapter", () => {
     await vi.advanceTimersByTimeAsync(2_000);
     expect(cursors).toEqual(["", ""]);
     expect(
-      store.getChannelState<string>("weixin-main", "updates-cursor"),
+      store.getChannelState<string>(
+        {
+          tenantId: "local",
+          channelId: "weixin-main",
+          accountId: "bot-id",
+        },
+        "updates-cursor",
+      ),
     ).toBeUndefined();
     await adapter.stop();
     store.close();

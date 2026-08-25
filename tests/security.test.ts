@@ -4,21 +4,8 @@ import {
   constantTimeTokenEqual,
   isPathInside,
   redactText,
-  SlidingWindowRateLimiter,
-  type Clock,
 } from "../src/core/security.js";
-
-class MutableClock implements Clock {
-  constructor(private timestamp: number) {}
-
-  now(): Date {
-    return new Date(this.timestamp);
-  }
-
-  advance(milliseconds: number): void {
-    this.timestamp += milliseconds;
-  }
-}
+import { toRouteKey } from "../src/core/contracts.js";
 
 describe("security primitives", () => {
   it("compares bearer tokens without length timing differences", () => {
@@ -47,14 +34,21 @@ describe("security primitives", () => {
     expect(chunks.at(-1)).toContain("[output truncated]");
   });
 
-  it("enforces a sliding sender rate limit", () => {
-    const clock = new MutableClock(1_000);
-    const limiter = new SlidingWindowRateLimiter(2, 1_000, clock);
-    limiter.consume("sender");
-    limiter.consume("sender");
-    expect(() => limiter.consume("sender")).toThrow("rate limit");
-    clock.advance(1_001);
-    expect(() => limiter.consume("sender")).not.toThrow();
+  it("hashes length-prefixed full route identities without delimiter collisions", () => {
+    const route = {
+      tenantId: "local" as const,
+      channelId: "a:b",
+      accountId: "bot",
+      conversationId: "c",
+      senderId: "owner",
+    };
+    expect(toRouteKey(route)).toHaveLength(64);
+    expect(toRouteKey(route)).not.toBe(
+      toRouteKey({ ...route, channelId: "a", conversationId: "b:c" }),
+    );
+    expect(toRouteKey(route)).not.toBe(
+      toRouteKey({ ...route, accountId: "other" }),
+    );
   });
 
   it("recognizes only paths inside the allowed root", () => {

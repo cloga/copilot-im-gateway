@@ -68,7 +68,7 @@ const updatesResponseSchema = z.object({
   errmsg: z.string().optional(),
   msgs: z.array(weixinMessageSchema).optional(),
   get_updates_buf: z.string().optional(),
-  longpolling_timeout_ms: z.number().int().positive().optional(),
+  longpolling_timeout_ms: z.number().int().optional(),
 });
 
 const sendResponseSchema = z.object({
@@ -106,6 +106,7 @@ export interface WeixinProtocolClient {
   getUpdates(input: {
     credentials: WeixinCredentials;
     cursor: string;
+    desiredTimeoutMs?: number;
     signal: AbortSignal;
   }): Promise<WeixinUpdates>;
   sendText(input: {
@@ -188,6 +189,7 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
   async getUpdates(input: {
     credentials: WeixinCredentials;
     cursor: string;
+    desiredTimeoutMs?: number;
     signal: AbortSignal;
   }): Promise<WeixinUpdates> {
     let response: unknown;
@@ -202,7 +204,7 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
             base_info: this.#baseInfo(),
           },
           token: input.credentials.botToken,
-          timeoutMs: 40_000,
+          timeoutMs: Math.max(1_000, (input.desiredTimeoutMs ?? 35_000) + 5_000),
           signal: input.signal,
         },
       );
@@ -211,7 +213,7 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
         return {
           messages: [],
           cursor: input.cursor,
-          longPollingTimeoutMs: 35_000,
+          longPollingTimeoutMs: input.desiredTimeoutMs ?? 35_000,
         };
       }
       throw error;
@@ -219,8 +221,16 @@ export class FetchWeixinProtocolClient implements WeixinProtocolClient {
     const parsed = updatesResponseSchema.parse(response);
     return {
       messages: parsed.msgs ?? [],
-      cursor: parsed.get_updates_buf ?? input.cursor,
-      longPollingTimeoutMs: parsed.longpolling_timeout_ms ?? 35_000,
+      cursor:
+        parsed.get_updates_buf !== undefined &&
+        parsed.get_updates_buf.length > 0
+          ? parsed.get_updates_buf
+          : input.cursor,
+      longPollingTimeoutMs:
+        parsed.longpolling_timeout_ms !== undefined &&
+        parsed.longpolling_timeout_ms > 0
+          ? parsed.longpolling_timeout_ms
+          : (input.desiredTimeoutMs ?? 35_000),
       ...(parsed.errcode === undefined ? {} : { errorCode: parsed.errcode }),
       ...(parsed.errmsg === undefined ? {} : { errorMessage: parsed.errmsg }),
     };

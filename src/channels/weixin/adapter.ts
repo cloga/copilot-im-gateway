@@ -6,6 +6,8 @@ import type {
   ImOutboundMessage,
   LoginCapableChannelAdapter,
 } from "../../core/contracts.js";
+import { localTenantId } from "../../core/contracts.js";
+import { GatewayError, gatewayErrorCodes } from "../../core/errors.js";
 import type { Clock } from "../../core/security.js";
 import { systemClock } from "../../core/security.js";
 import type { GatewayStore } from "../../daemon/store.js";
@@ -17,6 +19,7 @@ import type {
 } from "./protocol.js";
 
 interface ActiveLogin {
+  generation: number;
   qrCode: string;
   qrCodeUrl: string;
   pollingBaseUrl: string;
@@ -42,6 +45,9 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
   #login: ActiveLogin | undefined;
   #pollController: AbortController | undefined;
   #pollTask: Promise<void> | undefined;
+  #loginGeneration = 0;
+  #loginTransition: Promise<void> = Promise.resolve();
+  #stopped = true;
 
   constructor(options: WeixinAdapterOptions) {
     this.id = options.id ?? "weixin-main";
@@ -55,11 +61,13 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
   }
 
   async start(context: ChannelContext): Promise<void> {
+    this.#stopped = false;
+    this.#loginGeneration += 1;
     this.#context = context;
-    this.#credentials = this.#store.getChannelState<WeixinCredentials>(
+    this.#credentials = this.#store.getActiveChannelAccount<WeixinCredentials>(
+      localTenantId,
       this.id,
-      "credentials",
-    );
+    )?.credentials;
     if (this.#credentials === undefined) {
       await this.#setHealth({
         state: "awaiting_login",
@@ -71,29 +79,41 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
   }
 
   async stop(): Promise<void> {
-    this.#pollController?.abort();
-    await this.#pollTask;
-    this.#pollTask = undefined;
-    this.#pollController = undefined;
-    await this.#setHealth({ state: "stopped" });
+    this.#stopped = true;
+    this.#loginGeneration += 1;
+    await this.#serializeLoginTransition(async () => {
+      this.#login = undefined;
+      await this.#stopPolling();
+      await this.#setHealth({ state: "stopped" });
+    });
   }
 
   async startLogin(): Promise<ChannelLoginSnapshot> {
+    const generation = ++this.#loginGeneration;
     const localTokens =
       this.#credentials === undefined ? [] : [this.#credentials.botToken];
     const qr = await this.#protocol.getLoginQr(localTokens);
-    this.#login = {
-      qrCode: qr.id,
-      qrCodeUrl: qr.url,
-      pollingBaseUrl: qr.pollingBaseUrl,
-      startedAt: this.#clock.now().getTime(),
-    };
-    await this.#setHealth({
-      state: "awaiting_login",
-      since: this.#clock.now().toISOString(),
-      qrCodeUrl: qr.url,
+    return this.#serializeLoginTransition(async () => {
+      if (generation !== this.#loginGeneration) {
+        return { state: "not_started" };
+      }
+      if (this.#stopped) {
+        return { state: "not_started" };
+      }
+      this.#login = {
+        generation,
+        qrCode: qr.id,
+        qrCodeUrl: qr.url,
+        pollingBaseUrl: qr.pollingBaseUrl,
+        startedAt: this.#clock.now().getTime(),
+      };
+      await this.#setHealth({
+        state: "awaiting_login",
+        since: this.#clock.now().toISOString(),
+        qrCodeUrl: qr.url,
+      });
+      return { state: "waiting", qrCodeUrl: qr.url };
     });
-    return { state: "waiting", qrCodeUrl: qr.url };
   }
 
   async pollLogin(verifyCode?: string): Promise<ChannelLoginSnapshot> {
@@ -110,16 +130,22 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
       qrCode: login.qrCode,
       ...(verifyCode === undefined ? {} : { verifyCode }),
     });
-    return this.#applyLoginStatus(status);
+    return this.#serializeLoginTransition(async () => {
+      if (
+        this.#login !== login ||
+        login.generation !== this.#loginGeneration
+        || this.#stopped
+      ) {
+        return { state: "not_started" };
+      }
+      return this.#applyLoginStatus(login, status);
+    });
   }
 
   async #applyLoginStatus(
+    login: ActiveLogin,
     status: WeixinLoginStatus,
   ): Promise<ChannelLoginSnapshot> {
-    const login = this.#login;
-    if (login === undefined) {
-      return { state: "not_started" };
-    }
     switch (status.status) {
       case "wait":
         return { state: "waiting", qrCodeUrl: login.qrCodeUrl };
@@ -164,7 +190,7 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
             "Weixin login confirmation did not include required credentials.",
           );
         }
-        this.#credentials = {
+        const credentials: WeixinCredentials = {
           botToken: status.bot_token,
           botId: status.ilink_bot_id,
           baseUrl: status.baseurl,
@@ -172,13 +198,22 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
             ? {}
             : { userId: status.ilink_user_id }),
         };
-        this.#store.setChannelState(
-          this.id,
-          "credentials",
-          this.#credentials,
+        this.#login = undefined;
+        await this.#stopPolling();
+        if (login.generation !== this.#loginGeneration || this.#stopped) {
+          await this.#startPolling();
+          return { state: "not_started" };
+        }
+        this.#credentials = credentials;
+        this.#store.setActiveChannelAccount(
+          {
+            tenantId: localTenantId,
+            channelId: this.id,
+            accountId: credentials.botId,
+          },
+          credentials,
           this.#clock.now().toISOString(),
         );
-        this.#login = undefined;
         await this.#startPolling();
         return {
           state: "confirmed",
@@ -195,8 +230,23 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
     if (this.#credentials === undefined) {
       throw new Error("Weixin channel is not logged in.");
     }
+    if (
+      message.tenantId !== localTenantId ||
+      message.channelId !== this.id ||
+      message.accountId !== this.#credentials.botId ||
+      message.senderId !== message.conversationId
+    ) {
+      throw new Error(
+        "Outbound message identity does not match the active Weixin account and conversation owner.",
+      );
+    }
+    const accountIdentity = {
+      tenantId: localTenantId,
+      channelId: this.id,
+      accountId: this.#credentials.botId,
+    };
     const contextToken = this.#store.getChannelState<string>(
-      this.id,
+      accountIdentity,
       `context:${message.conversationId}`,
     );
     if (contextToken === undefined) {
@@ -214,25 +264,62 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
   }
 
   async #startPolling(): Promise<void> {
-    if (this.#credentials === undefined || this.#pollTask !== undefined) {
+    if (
+      this.#stopped ||
+      this.#credentials === undefined ||
+      this.#pollTask !== undefined
+    ) {
       return;
     }
-    this.#pollController = new AbortController();
-    await this.#setHealth({
+
+    const credentials = this.#credentials;
+    const controller = new AbortController();
+    this.#pollController = controller;
+    const started = this.#setHealth({
       state: "starting",
       since: this.#clock.now().toISOString(),
     });
-    this.#pollTask = this.#pollLoop(
-      this.#credentials,
-      this.#pollController.signal,
-    ).finally(() => {
-      this.#pollTask = undefined;
-    });
+    const task = started
+      .then(async () => this.#pollLoop(credentials, controller.signal))
+      .finally(() => {
+        if (this.#pollTask === task) {
+          this.#pollTask = undefined;
+          this.#pollController = undefined;
+        }
+      });
+    this.#pollTask = task;
+    await started;
     await this.#setHealth({
       state: "ready",
       since: this.#clock.now().toISOString(),
-      accountLabel: this.#credentials.botId,
+      accountLabel: credentials.botId,
     });
+  }
+
+  async #stopPolling(): Promise<void> {
+    const task = this.#pollTask;
+    if (task === undefined) {
+      return;
+    }
+
+    this.#pollController?.abort();
+    await task;
+    this.#pollTask = undefined;
+    this.#pollController = undefined;
+  }
+
+  async #serializeLoginTransition<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.#loginTransition;
+    let release: (() => void) | undefined;
+    this.#loginTransition = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release?.();
+    }
   }
 
   async #pollLoop(
@@ -240,13 +327,22 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
     signal: AbortSignal,
   ): Promise<void> {
     let cursor =
-      this.#store.getChannelState<string>(this.id, "updates-cursor") ?? "";
+      this.#store.getChannelState<string>(
+        {
+          tenantId: localTenantId,
+          channelId: this.id,
+          accountId: credentials.botId,
+        },
+        "updates-cursor",
+      ) ?? "";
+    let desiredTimeoutMs = 35_000;
     let retryMs = 2_000;
     while (!signal.aborted) {
       try {
         const updates = await this.#protocol.getUpdates({
           credentials,
           cursor,
+          desiredTimeoutMs,
           signal,
         });
         if (signal.aborted) {
@@ -266,16 +362,23 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
           );
         }
         for (const message of updates.messages) {
-          await this.#acceptMessage(message);
+          await this.#acceptMessage(credentials, message);
         }
-        if (updates.cursor !== cursor) {
+        if (updates.cursor.length > 0 && updates.cursor !== cursor) {
           cursor = updates.cursor;
           this.#store.setChannelState(
-            this.id,
+            {
+              tenantId: localTenantId,
+              channelId: this.id,
+              accountId: credentials.botId,
+            },
             "updates-cursor",
             cursor,
             this.#clock.now().toISOString(),
           );
+        }
+        if (updates.longPollingTimeoutMs > 0) {
+          desiredTimeoutMs = updates.longPollingTimeoutMs;
         }
         retryMs = 2_000;
         await sleep(updates.messages.length > 0 ? 100 : 300, signal);
@@ -295,7 +398,10 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
     }
   }
 
-  async #acceptMessage(message: WeixinMessage): Promise<void> {
+  async #acceptMessage(
+    credentials: WeixinCredentials,
+    message: WeixinMessage,
+  ): Promise<void> {
     if (
       message.message_type !== 1 ||
       message.from_user_id === undefined ||
@@ -303,74 +409,106 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
     ) {
       return;
     }
-    const text = (message.item_list ?? [])
-      .flatMap((item) => [
-        item.text_item?.text,
-        item.voice_item?.text,
-      ])
-      .filter((value): value is string => value !== undefined)
-      .join("\n")
-      .trim();
-    const attachments = (message.item_list ?? []).flatMap((item, index) => {
-      if (item.image_item !== undefined) {
-        return [
+    const senderId = message.from_user_id;
+    const messageId =
+      message.client_id ??
+      String(message.message_id ?? `${message.create_time_ms ?? 0}`);
+    const receivedAt = new Date(
+      message.create_time_ms ?? this.#clock.now().getTime(),
+    ).toISOString();
+    try {
+      await this.#context?.onInbound({
+        identity: {
+          tenantId: localTenantId,
+          channelId: this.id,
+          accountId: credentials.botId,
+          conversationId: senderId,
+          senderId,
+        },
+        messageId,
+        receivedAt,
+        materialize: async () => {
+        const text = (message.item_list ?? [])
+          .flatMap((item) => [
+            item.text_item?.text,
+            item.voice_item?.text,
+          ])
+          .filter((value): value is string => value !== undefined)
+          .join("\n")
+          .trim();
+        const attachments = (message.item_list ?? []).flatMap((item, index) => {
+          if (item.image_item !== undefined) {
+            return [
+              {
+                id: item.msg_id ?? `image-${index}`,
+                mediaType: "image/*",
+                ...(item.image_item.mid_size === undefined
+                  ? {}
+                  : { sizeBytes: item.image_item.mid_size }),
+              },
+            ];
+          }
+          if (item.file_item !== undefined) {
+            const size = Number(item.file_item.len);
+            return [
+              {
+                id: item.msg_id ?? `file-${index}`,
+                mediaType: "application/octet-stream",
+                ...(Number.isFinite(size) ? { sizeBytes: size } : {}),
+                ...(item.file_item.file_name === undefined
+                  ? {}
+                  : { fileName: item.file_item.file_name }),
+              },
+            ];
+          }
+          if (item.video_item !== undefined) {
+            return [
+              {
+                id: item.msg_id ?? `video-${index}`,
+                mediaType: "video/*",
+                ...(item.video_item.video_size === undefined
+                  ? {}
+                  : { sizeBytes: item.video_item.video_size }),
+              },
+            ];
+          }
+          return [];
+        });
+        this.#store.setChannelState(
           {
-            id: item.msg_id ?? `image-${index}`,
-            mediaType: "image/*",
-            ...(item.image_item.mid_size === undefined
-              ? {}
-              : { sizeBytes: item.image_item.mid_size }),
+            tenantId: localTenantId,
+            channelId: this.id,
+            accountId: credentials.botId,
           },
-        ];
+          `context:${senderId}`,
+          message.context_token,
+          this.#clock.now().toISOString(),
+        );
+        return {
+          tenantId: localTenantId,
+          channelId: this.id,
+          accountId: credentials.botId,
+          conversationId: senderId,
+          messageId,
+          senderId,
+          receivedAt,
+          text,
+          attachments,
+        };
+        },
+      });
+    } catch (error) {
+      if (
+        error instanceof GatewayError &&
+        (error.code === gatewayErrorCodes.senderDenied ||
+          error.code === gatewayErrorCodes.workspaceDenied ||
+          error.code === gatewayErrorCodes.rateLimited ||
+          error.code === gatewayErrorCodes.capacityExceeded)
+      ) {
+        return;
       }
-      if (item.file_item !== undefined) {
-        const size = Number(item.file_item.len);
-        return [
-          {
-            id: item.msg_id ?? `file-${index}`,
-            mediaType: "application/octet-stream",
-            ...(Number.isFinite(size) ? { sizeBytes: size } : {}),
-            ...(item.file_item.file_name === undefined
-              ? {}
-              : { fileName: item.file_item.file_name }),
-          },
-        ];
-      }
-      if (item.video_item !== undefined) {
-        return [
-          {
-            id: item.msg_id ?? `video-${index}`,
-            mediaType: "video/*",
-            ...(item.video_item.video_size === undefined
-              ? {}
-              : { sizeBytes: item.video_item.video_size }),
-          },
-        ];
-      }
-      return [];
-    });
-    if (text.length === 0 && attachments.length === 0) {
-      return;
+      throw error;
     }
-    this.#store.setChannelState(
-      this.id,
-      `context:${message.from_user_id}`,
-      message.context_token,
-      this.#clock.now().toISOString(),
-    );
-    await this.#context?.onInbound({
-      channelId: this.id,
-      conversationId: message.from_user_id,
-      messageId:
-        message.client_id ??
-        String(message.message_id ?? `${message.create_time_ms ?? 0}`),
-      senderId: message.from_user_id,
-      receivedAt: new Date(
-        message.create_time_ms ?? this.#clock.now().getTime(),
-      ).toISOString(),
-      text,
-      attachments,
-    });
   }
 
   async #setHealth(health: ChannelHealth): Promise<void> {

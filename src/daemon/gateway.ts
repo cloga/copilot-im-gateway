@@ -4,20 +4,21 @@ import type {
   ImChannelAdapter,
   ImInboundMessage,
   LoginCapableChannelAdapter,
+  MinimalInboundEnvelope,
+  RouteIdentity,
 } from "../core/contracts.js";
 import { isLoginCapableChannel, toRouteKey } from "../core/contracts.js";
 import { GatewayError, gatewayErrorCodes } from "../core/errors.js";
-import { KeyedSerialQueue } from "../core/serial-queue.js";
 import {
   chunkOutboundText,
   createApprovalNonce,
   type Clock,
   type PermissionScope,
   type RemoteIdentity,
-  SlidingWindowRateLimiter,
   systemClock,
 } from "../core/security.js";
 import type {
+  AdmissionResult,
   ApprovalRecord,
   GatewayStore,
   LeasedInboundMessage,
@@ -26,15 +27,11 @@ import type {
 export class GatewayService implements ChannelContext {
   readonly #adapters = new Map<string, ImChannelAdapter>();
   readonly #health = new Map<string, ChannelHealth>();
-  readonly #queue = new KeyedSerialQueue();
-  readonly #rateLimiter: SlidingWindowRateLimiter;
 
   constructor(
     readonly store: GatewayStore,
     private readonly clock: Clock = systemClock,
-  ) {
-    this.#rateLimiter = new SlidingWindowRateLimiter(12, 60_000, clock);
-  }
+  ) {}
 
   registerChannel(adapter: ImChannelAdapter): void {
     if (this.#adapters.has(adapter.id)) {
@@ -100,80 +97,108 @@ export class GatewayService implements ChannelContext {
     });
   }
 
-  async onInbound(message: ImInboundMessage): Promise<void> {
-    const routeKey = toRouteKey(message.channelId, message.conversationId);
-    await this.#queue.run(routeKey, async () => {
-      this.#rateLimiter.consume(
-        `${message.channelId}:${message.senderId}`,
-      );
-      if (!this.store.isSenderAllowed(message.channelId, message.senderId)) {
-        this.store.appendAudit({
-          createdAt: this.clock.now().toISOString(),
-          eventType: "inbound.sender.denied",
-          actor: `sender:${message.senderId}`,
-          routeKey,
-        });
-        throw new GatewayError({
-          code: gatewayErrorCodes.senderDenied,
-          message: "Sender is not paired with this gateway.",
-          status: 403,
-        });
-      }
+  async onInbound(envelope: MinimalInboundEnvelope): Promise<void> {
+    const now = this.clock.now().toISOString();
+    const reservation = this.store.reserveInbound(envelope, now);
+    this.#throwAdmissionError(reservation);
+    if (reservation.disposition === "duplicate") {
+      return;
+    }
 
-      const commandHandled = this.#handleApprovalCommand(message);
-      if (commandHandled) {
-        return;
+    let message: ImInboundMessage;
+    try {
+      message = await envelope.materialize();
+      this.#validateMaterializedEnvelope(envelope, message);
+      const command = parseApprovalCommand(message.text);
+      if (command === undefined) {
+        this.store.finalizeInbound(
+          reservation,
+          message,
+          this.clock.now().toISOString(),
+        );
+      } else {
+        this.store.finalizeApprovalCommand(
+          reservation,
+          message,
+          command.nonce,
+          command.decision,
+          this.clock.now().toISOString(),
+        );
       }
-
-      const inserted = this.store.insertInbound(
-        message,
-        this.clock.now().toISOString(),
-      );
-      this.store.appendAudit({
-        createdAt: this.clock.now().toISOString(),
-        eventType: inserted
-          ? "inbound.accepted"
-          : "inbound.duplicate",
-        actor: `sender:${message.senderId}`,
-        routeKey,
-        details: { messageId: message.messageId },
-      });
-    });
+    } catch (error) {
+      try {
+        this.store.failMaterialization(
+          reservation,
+          envelope.messageId,
+          this.clock.now().toISOString(),
+        );
+      } catch (finalizationError) {
+        if (
+          !(
+            finalizationError instanceof GatewayError &&
+            finalizationError.code === gatewayErrorCodes.conflict
+          )
+        ) {
+          throw finalizationError;
+        }
+      }
+      throw error;
+    }
   }
 
-  #handleApprovalCommand(message: ImInboundMessage): boolean {
-    const match = /^\/(approve|deny)\s+([A-Za-z0-9_-]{16,200})\s*$/i.exec(
-      message.text.trim(),
-    );
-    if (match === null) {
-      return false;
-    }
-    const command = match[1]?.toLowerCase();
-    const nonce = match[2];
-    if (nonce === undefined || command === undefined) {
-      return false;
-    }
-    const bindings = this.store.listBindings();
-    const routeKey = toRouteKey(message.channelId, message.conversationId);
-    const binding = bindings.find((candidate) => candidate.routeKey === routeKey);
-    if (binding === undefined) {
+  #throwAdmissionError(admission: AdmissionResult): void {
+    const disposition =
+      admission.disposition === "duplicate"
+        ? admission.previousDisposition
+        : admission.disposition;
+    if (disposition === "denied") {
       throw new GatewayError({
-        code: gatewayErrorCodes.notFound,
-        message: "Conversation is not bound to a Copilot session.",
-        status: 404,
+        code: gatewayErrorCodes.senderDenied,
+        message: "Sender is not paired with this gateway.",
+        status: 403,
       });
     }
-    this.decideApproval({
-      nonce,
-      decision: command === "approve" ? "approved" : "denied",
-      identity: {
-        channelId: message.channelId,
-        conversationId: message.conversationId,
-        senderId: message.senderId,
-        sessionId: binding.sessionId,
-      },
-    });
-    return true;
+    if (disposition === "route_denied") {
+      throw new GatewayError({
+        code: gatewayErrorCodes.workspaceDenied,
+        message:
+          "Conversation is not bound to an authorized personal workspace.",
+        status: 403,
+      });
+    }
+    if (disposition === "rate_limited") {
+      throw new GatewayError({
+        code: gatewayErrorCodes.rateLimited,
+        message: "Message rate limit exceeded.",
+        status: 429,
+        retryable: false,
+      });
+    }
+    if (disposition === "capacity_rejected") {
+      throw new GatewayError({
+        code: gatewayErrorCodes.capacityExceeded,
+        message: "Gateway pending-message capacity is full.",
+        status: 503,
+        retryable: false,
+      });
+    }
+  }
+
+  #validateMaterializedEnvelope(
+    envelope: MinimalInboundEnvelope,
+    message: ImInboundMessage,
+  ): void {
+    if (
+      message.messageId !== envelope.messageId ||
+      message.receivedAt !== envelope.receivedAt ||
+      toRouteKey(message) !== toRouteKey(envelope.identity)
+    ) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.invalidInput,
+        message: "Materialized message identity does not match its envelope.",
+        status: 400,
+      });
+    }
   }
 
   leaseInbound(
@@ -187,12 +212,29 @@ export class GatewayService implements ChannelContext {
     );
   }
 
-  async sendOutbound(input: {
-    channelId: string;
-    conversationId: string;
-    correlationId: string;
-    text: string;
-  }): Promise<number> {
+  completeInbound(input: {
+    id: number;
+    leaseId: string;
+    outcome: "completed" | "failed";
+    errorCode?: string;
+    retryable: boolean;
+  }): void {
+    this.store.completeInbound(
+      input.id,
+      input.leaseId,
+      input.outcome,
+      input.errorCode,
+      input.retryable,
+      this.clock.now().toISOString(),
+    );
+  }
+
+  async sendOutbound(
+    input: RouteIdentity & {
+      correlationId: string;
+      text: string;
+    },
+  ): Promise<number> {
     const adapter = this.#adapters.get(input.channelId);
     if (adapter === undefined) {
       throw new GatewayError({
@@ -204,9 +246,12 @@ export class GatewayService implements ChannelContext {
     const chunks = chunkOutboundText(input.text);
     for (const [index, text] of chunks.entries()) {
       await adapter.send({
+        tenantId: input.tenantId,
         channelId: input.channelId,
+        accountId: input.accountId,
         conversationId: input.conversationId,
-        correlationId: `${input.correlationId}:${index + 1}`,
+        senderId: input.senderId,
+        correlationId: `${input.correlationId}-${index + 1}`,
         text,
         format: "plain",
         final: index === chunks.length - 1,
@@ -216,7 +261,7 @@ export class GatewayService implements ChannelContext {
       createdAt: this.clock.now().toISOString(),
       eventType: "outbound.sent",
       actor: "copilot-extension",
-      routeKey: toRouteKey(input.channelId, input.conversationId),
+      routeKey: toRouteKey(input),
       details: { chunks: chunks.length },
     });
     return chunks.length;
@@ -227,33 +272,19 @@ export class GatewayService implements ChannelContext {
     identity: RemoteIdentity;
     scope: PermissionScope;
     ttlSeconds: number;
-  }): { nonce: string; expiresAt: string } {
+  }): { nonce: string; expiresAt: string; operationDigest: string } {
     const nonce = createApprovalNonce();
     const now = this.clock.now();
     const expiresAt = new Date(
       now.getTime() + input.ttlSeconds * 1000,
     ).toISOString();
-    this.store.createApproval({
+    const result = this.store.createApproval({
       ...input,
       nonce,
       expiresAt,
       now: now.toISOString(),
     });
-    this.store.appendAudit({
-      createdAt: now.toISOString(),
-      eventType: "approval.requested",
-      actor: "copilot-extension",
-      routeKey: toRouteKey(
-        input.identity.channelId,
-        input.identity.conversationId,
-      ),
-      details: {
-        requestId: input.requestId,
-        kind: input.scope.kind,
-        expiresAt,
-      },
-    });
-    return { nonce, expiresAt };
+    return { nonce, expiresAt, operationDigest: result.operationDigest };
   }
 
   decideApproval(input: {
@@ -261,21 +292,10 @@ export class GatewayService implements ChannelContext {
     identity: RemoteIdentity;
     decision: "approved" | "denied";
   }): ApprovalRecord {
-    const record = this.store.decideApproval({
+    return this.store.decideApproval({
       ...input,
       now: this.clock.now().toISOString(),
     });
-    this.store.appendAudit({
-      createdAt: this.clock.now().toISOString(),
-      eventType: `approval.${input.decision}`,
-      actor: `sender:${input.identity.senderId}`,
-      routeKey: toRouteKey(
-        input.identity.channelId,
-        input.identity.conversationId,
-      ),
-      details: { requestId: record.requestId },
-    });
-    return record;
   }
 
   getStatus(): {
@@ -299,4 +319,21 @@ export class GatewayService implements ChannelContext {
       ),
     };
   }
+}
+
+function parseApprovalCommand(
+  text: string,
+): { nonce: string; decision: "approved" | "denied" } | undefined {
+  const match = /^\/(approve|deny)\s+([A-Za-z0-9_-]{16,200})\s*$/i.exec(
+    text.trim(),
+  );
+  const command = match?.[1]?.toLowerCase();
+  const nonce = match?.[2];
+  if (nonce === undefined || command === undefined) {
+    return undefined;
+  }
+  return {
+    nonce,
+    decision: command === "approve" ? "approved" : "denied",
+  };
 }

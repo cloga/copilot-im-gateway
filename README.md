@@ -12,13 +12,13 @@ through the official GitHub Copilot SDK extension runtime.
 ## What is included
 
 - A durable daemon bound to `127.0.0.1` with bearer authentication.
-- Generic channel contracts, stable `channelId:conversationId` routing, durable
-  bindings, serial turn processing, deduplication, rate limiting, redaction,
+- Generic channel contracts, collision-safe account-aware route identities,
+  durable bindings, per-route FIFO processing, deduplication, rate limiting, redaction,
   bounded output, audit records, and expiring one-time approvals.
 - A WeChat iLink adapter with a protocol boundary that can use the real service
   or deterministic fixtures.
 - A project-scoped Copilot extension that joins the foreground session with
-  `joinSession()`, forwards approved inbound turns with `session.send()`, and
+  `joinSession()`, forwards approved inbound turns with `session.sendAndWait()`, and
   publishes safe final output through the daemon.
 - An experimental in-app Canvas for login, health, bindings, workspace aliases,
   pending approvals, and audit visibility.

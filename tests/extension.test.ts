@@ -72,13 +72,27 @@ describe("Copilot extension security posture", () => {
     await client.lease("session");
     await client.complete(1, "lease", "failed", "SAFE_ERROR");
     await client.sendOutbound({
+      tenantId: "local",
       channelId: "weixin-main",
+      accountId: "bot",
       conversationId: "conversation",
+      senderId: "sender",
       correlationId: "message",
       text: "safe",
     });
     await client.createApproval({ requestId: "request" });
-    await client.consumeApproval("request", "session");
+    await client.consumeApproval(
+      "request",
+      {
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot",
+        conversationId: "conversation",
+        senderId: "sender",
+        sessionId: "session",
+      },
+      "a".repeat(64),
+    );
     expect(fetchMock).toHaveBeenCalledTimes(6);
 
     await writeFile(tokenPath, "short", "utf8");
@@ -104,6 +118,7 @@ describe("Copilot extension security posture", () => {
     vi.spyOn(client, "createApproval").mockResolvedValue({
       nonce: "nonce",
       expiresAt: "soon",
+      operationDigest: "a".repeat(64),
     });
     vi.spyOn(client, "sendOutbound").mockResolvedValue({});
     vi.spyOn(client, "consumeApproval").mockResolvedValue({
@@ -111,7 +126,9 @@ describe("Copilot extension security posture", () => {
     });
     const controller = new AbortController();
     const turn = {
+      tenantId: "local",
       channelId: "weixin-main",
+      accountId: "bot",
       conversationId: "conversation",
       senderId: "sender",
       sessionId: "session",
@@ -286,7 +303,9 @@ describe("Copilot extension security posture", () => {
       leaseId: "lease",
       workspaceAlias: "personal",
       message: {
+        tenantId: "local",
         channelId: "weixin-main",
+        accountId: "bot",
         conversationId: "conversation",
         senderId: "sender",
         messageId: "message",
@@ -322,6 +341,7 @@ describe("Copilot extension security posture", () => {
       "lease",
       "failed",
       "REMOTE_TURN_FAILED",
+      false,
     );
 
     const controller = new AbortController();
@@ -395,12 +415,23 @@ describe("Copilot extension security posture", () => {
       ["/api/login/start", {}],
       ["/api/login/poll", { verifyCode: "123456" }],
       ["/api/aliases", { alias: "personal", path: process.cwd() }],
-      ["/api/senders", { channelId: "weixin-main", senderId: "sender" }],
+      [
+        "/api/senders",
+        {
+          tenantId: "local",
+          channelId: "weixin-main",
+          accountId: "bot",
+          senderId: "sender",
+        },
+      ],
       [
         "/api/bindings",
         {
           channelId: "weixin-main",
+          tenantId: "local",
+          accountId: "bot",
           conversationId: "conversation",
+          senderId: "sender",
           workspaceAlias: "personal",
         },
       ],

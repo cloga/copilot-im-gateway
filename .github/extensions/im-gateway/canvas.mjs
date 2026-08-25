@@ -62,8 +62,8 @@ function renderHtml() {
       <h2>Policy</h2>
       <div class="grid">
         <form id="alias-form"><strong>Workspace alias</strong><input name="alias" placeholder="personal-repo" required /><input name="path" placeholder="C:\\path\\to\\repo" required /><button>Save personal alias</button></form>
-        <form id="sender-form"><strong>Allowed sender</strong><input name="channelId" value="weixin-main" required /><input name="senderId" placeholder="WeChat user ID" required /><button>Allow sender</button></form>
-        <form id="binding-form"><strong>Session binding</strong><input name="channelId" value="weixin-main" required /><input name="conversationId" placeholder="WeChat conversation/user ID" required /><input name="workspaceAlias" placeholder="personal-repo" required /><button>Bind current session</button></form>
+        <form id="sender-form"><strong>Allowed sender</strong><input name="tenantId" value="local" required /><input name="channelId" value="weixin-main" required /><input name="accountId" placeholder="Negotiated bot account ID" required /><input name="senderId" placeholder="WeChat user ID" required /><button>Allow sender</button></form>
+        <form id="binding-form"><strong>Session binding</strong><input name="tenantId" value="local" required /><input name="channelId" value="weixin-main" required /><input name="accountId" placeholder="Negotiated bot account ID" required /><input name="conversationId" placeholder="WeChat conversation/user ID" required /><input name="senderId" placeholder="Conversation owner ID" required /><input name="workspaceAlias" placeholder="personal-repo" required /><button>Bind current session</button></form>
       </div>
     </section>
     <section><h2>Pending approvals</h2><div id="approvals"></div></section>

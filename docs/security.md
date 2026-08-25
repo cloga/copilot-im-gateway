@@ -16,6 +16,8 @@ scope: command, canonical path label, MCP tool, or network host. The nonce is
 bound to:
 
 - channel ID
+- local tenant ID
+- negotiated bot/account ID
 - conversation ID
 - sender ID
 - Copilot session ID
@@ -31,9 +33,16 @@ Secrets matching common token/key formats and local absolute paths are replaced
 before outbound delivery. The gateway never sends Copilot reasoning events,
 hidden context, raw tool calls, raw errors, or permission payloads to IM.
 
-The local SQLite database and bearer token should be protected by OS user
-permissions and disk encryption. The project does not provide multi-user host
-isolation in this initial personal/local scope.
+The local SQLite database currently stores iLink credentials in plaintext.
+Protect the database and bearer token with OS user permissions and disk
+encryption. Application-level credential encryption is the next defense layer;
+the project does not provide multi-user host isolation in this personal/local
+scope.
+
+Inbound authorization uses only a minimal identity envelope. Rejected bodies and
+attachments are never materialized or persisted, and denial audits contain only
+labeled identity hashes. Terminal inbox metadata is retained for 14 days and
+audit metadata for 30 days by default.
 
 ## Explicit non-goals
 

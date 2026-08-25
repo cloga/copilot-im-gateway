@@ -7,6 +7,7 @@ import {
 } from "node:http";
 import { URL } from "node:url";
 import { ZodError, type ZodType } from "zod";
+import { deferInboundMessage } from "../core/contracts.js";
 import { GatewayError, gatewayErrorCodes, toErrorEnvelope } from "../core/errors.js";
 import { constantTimeTokenEqual } from "../core/security.js";
 import type { GatewayService } from "./gateway.js";
@@ -214,12 +215,6 @@ async function handleRequest(
         input.classification,
         now,
       );
-      options.service.store.appendAudit({
-        createdAt: now,
-        eventType: "workspace.alias.updated",
-        actor: "local-admin",
-        details: { alias: input.alias, classification: input.classification },
-      });
       sendJson(response, 200, options.service.store.getWorkspaceAlias(input.alias));
       return;
     }
@@ -227,17 +222,15 @@ async function handleRequest(
       const input = await readJson(request, allowedSenderSchema);
       const now = new Date().toISOString();
       options.service.store.allowSender(
-        input.channelId,
-        input.senderId,
+        {
+          tenantId: input.tenantId,
+          channelId: input.channelId,
+          accountId: input.accountId,
+          senderId: input.senderId,
+        },
         input.displayName,
         now,
       );
-      options.service.store.appendAudit({
-        createdAt: now,
-        eventType: "sender.allowed",
-        actor: "local-admin",
-        details: { channelId: input.channelId, senderId: input.senderId },
-      });
       sendJson(response, 201, { ok: true });
       return;
     }
@@ -258,23 +251,15 @@ async function handleRequest(
         input,
         new Date().toISOString(),
       );
-      options.service.store.appendAudit({
-        createdAt: new Date().toISOString(),
-        eventType: "session.binding.updated",
-        actor: "local-admin",
-        routeKey: binding.routeKey,
-        details: {
-          sessionId: binding.sessionId,
-          workspaceAlias: binding.workspaceAlias,
-        },
-      });
       sendJson(response, 200, binding);
       return;
     }
     if (method === "POST" && pathname === "/v1/inbound") {
       const input = await readJson(request, inboundMessageSchema);
-      await options.service.onInbound({
+      await options.service.onInbound(deferInboundMessage({
+        tenantId: input.tenantId,
         channelId: input.channelId,
+        accountId: input.accountId,
         conversationId: input.conversationId,
         messageId: input.messageId,
         senderId: input.senderId,
@@ -293,7 +278,7 @@ async function handleRequest(
         ...(input.replyToMessageId === undefined
           ? {}
           : { replyToMessageId: input.replyToMessageId }),
-      });
+      }));
       sendJson(response, 202, { accepted: true });
       return;
     }
@@ -331,12 +316,13 @@ async function handleRequest(
     if (method === "POST" && completeMatch !== null) {
       const id = Number(completeMatch[1]);
       const input = await readJson(request, completeMessageSchema);
-      options.service.store.completeInbound(
+      options.service.completeInbound({
         id,
-        input.leaseId,
-        input.outcome,
-        input.errorCode,
-      );
+        leaseId: input.leaseId,
+        outcome: input.outcome,
+        ...(input.errorCode === undefined ? {} : { errorCode: input.errorCode }),
+        retryable: input.retryable,
+      });
       sendJson(response, 200, { ok: true });
       return;
     }
@@ -365,23 +351,15 @@ async function handleRequest(
         ...input,
         now,
       });
-      options.service.store.appendAudit({
-        createdAt: now,
-        eventType: `approval.${input.decision}`,
-        actor: "local-admin",
-        routeKey: `${record.identity.channelId}:${record.identity.conversationId}`,
-        details: { requestId: record.requestId },
-      });
       sendJson(response, 200, record);
       return;
     }
     if (method === "POST" && pathname === "/v1/approvals/consume") {
       const input = await readJson(request, approvalConsumeSchema);
-      const record = options.service.store.consumeApproval(
-        input.requestId,
-        input.sessionId,
-        new Date().toISOString(),
-      );
+      const record = options.service.store.consumeApproval({
+        ...input,
+        now: new Date().toISOString(),
+      });
       sendJson(response, 200, { approval: record ?? null });
       return;
     }

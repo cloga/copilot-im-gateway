@@ -129,8 +129,11 @@ describe("gateway HTTP API", () => {
       {
         method: "POST",
         body: JSON.stringify({
+          tenantId: "local",
           channelId: "weixin-main",
+          accountId: "bot",
           conversationId: "conversation",
+          senderId: "sender",
           sessionId: "session",
           workspaceAlias: "work",
         }),
@@ -158,7 +161,9 @@ describe("gateway HTTP API", () => {
     expect(
       (
         await post("/v1/allowed-senders", {
+          tenantId: "local",
           channelId: "weixin-main",
+          accountId: "bot",
           senderId: "sender",
         })
       ).status,
@@ -166,8 +171,11 @@ describe("gateway HTTP API", () => {
     expect(
       (
         await post("/v1/bindings", {
+          tenantId: "local",
           channelId: "weixin-main",
+          accountId: "bot",
           conversationId: "conversation",
+          senderId: "sender",
           sessionId: "session",
           workspaceAlias: "personal",
         })
@@ -176,7 +184,9 @@ describe("gateway HTTP API", () => {
     expect(
       (
         await post("/v1/inbound", {
+          tenantId: "local",
           channelId: "weixin-main",
+          accountId: "bot",
           conversationId: "conversation",
           messageId: "message-1",
           senderId: "sender",
@@ -205,8 +215,11 @@ describe("gateway HTTP API", () => {
     expect(
       (
         await post("/v1/outbound", {
+          tenantId: "local",
           channelId: "weixin-main",
+          accountId: "bot",
           conversationId: "conversation",
+          senderId: "sender",
           correlationId: "message-1",
           text: "safe response",
         })

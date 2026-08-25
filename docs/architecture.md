@@ -24,7 +24,10 @@ authentication/model APIs are explicitly outside the architecture.
 
 ## Routing
 
-An inbound route key is `channelId:conversationId`. It maps to a durable binding
+An inbound route identity explicitly contains the local tenant, adapter ID,
+negotiated bot/account ID, conversation/thread ID, and sender owner. Components
+are length-prefixed and SHA-256 hashed into the durable route key, so delimiter
+ambiguity and cross-account state sharing are impossible. It maps to a binding
 containing the Copilot session ID and an allowed workspace alias. The daemon
 leases inbound messages to the extension; the extension submits the turn to the
 foreground session only when the session and workspace match the binding.
@@ -40,7 +43,8 @@ The extension installs `onPermissionRequest`; it never uses `approveAll`.
 2. The extension converts it to a redacted scope summary.
 3. The daemon persists a pending approval and returns a one-time nonce.
 4. The channel sends an approve/deny command containing the nonce.
-5. The daemon validates expiry and the sender/channel/conversation/session tuple.
+5. The daemon validates expiry, tenant/account/route/sender/session identity, and
+   the stable operation/scope digest.
 6. The extension consumes the decision exactly once and returns
    `{ kind: "approved" }` or `{ kind: "reject" }` to Copilot.
 
@@ -62,9 +66,17 @@ Managed-policy approvals are never bypassed.
 
 ## Durability
 
-SQLite stores normalized messages, bindings, aliases, approvals, and audit
-events. Message IDs are unique per channel to provide idempotency. State changes
-and their audit records use the same transaction where practical.
+SQLite stores normalized messages, bindings, aliases, approvals, rate windows,
+admission dispositions, ownership and work leases, and audit events. Message IDs
+are idempotent per full route. `BEGIN IMMEDIATE` couples state transitions with
+their audit records. Durable sequence numbers prevent retrying work from being
+overtaken after restart. Terminal inbox metadata and audit data default to
+14-day and 30-day retention respectively.
+
+Transient extension failures use capped durable retries. The bridge is
+necessarily at-least-once across the boundary where `sendAndWait()` may succeed
+but the completion acknowledgement is lost; prompts and tools should therefore
+remain idempotent where possible.
 
 ## Extension lifecycle
 

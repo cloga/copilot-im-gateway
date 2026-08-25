@@ -12,7 +12,9 @@ import {
 const connection = resolveGatewayConnection();
 const client = new GatewayClient(connection);
 /** @type {{
+ *   tenantId:string,
  *   channelId:string,
+ *   accountId:string,
  *   conversationId:string,
  *   senderId:string,
  *   sessionId:string,

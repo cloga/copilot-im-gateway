@@ -72,20 +72,22 @@ export class GatewayClient {
    * @param {string} leaseId
    * @param {"completed"|"failed"} outcome
    * @param {string} [errorCode]
+   * @param {boolean} [retryable]
    */
-  complete(id, leaseId, outcome, errorCode) {
+  complete(id, leaseId, outcome, errorCode, retryable = false) {
     return this.request(`/v1/messages/${id}/complete`, {
       method: "POST",
       body: JSON.stringify({
         leaseId,
         outcome,
         ...(errorCode === undefined ? {} : { errorCode }),
+        retryable,
       }),
     });
   }
 
   /**
-   * @param {{channelId:string, conversationId:string, correlationId:string, text:string}} message
+   * @param {{tenantId:string, channelId:string, accountId:string, conversationId:string, senderId:string, correlationId:string, text:string}} message
    */
   sendOutbound(message) {
     return this.request("/v1/outbound", {
@@ -102,11 +104,11 @@ export class GatewayClient {
     });
   }
 
-  /** @param {string} requestId @param {string} sessionId */
-  consumeApproval(requestId, sessionId) {
+  /** @param {string} requestId @param {Record<string, string>} identity @param {string} operationDigest */
+  consumeApproval(requestId, identity, operationDigest) {
     return this.request("/v1/approvals/consume", {
       method: "POST",
-      body: JSON.stringify({ requestId, sessionId }),
+      body: JSON.stringify({ requestId, identity, operationDigest }),
     });
   }
 }

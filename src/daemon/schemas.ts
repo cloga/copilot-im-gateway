@@ -6,8 +6,19 @@ const identifier = z
   .max(200)
   .regex(/^[A-Za-z0-9._:@/-]+$/);
 
-export const inboundMessageSchema = z.object({
+const tenantId = z.literal("local").default("local");
+const routeIdentity = z.object({
+  tenantId,
   channelId: identifier,
+  accountId: identifier,
+  conversationId: identifier,
+  senderId: identifier,
+});
+
+export const inboundMessageSchema = z.object({
+  tenantId,
+  channelId: identifier,
+  accountId: identifier,
   conversationId: identifier,
   messageId: identifier,
   senderId: identifier,
@@ -35,18 +46,25 @@ export const completeMessageSchema = z.object({
   leaseId: z.uuid(),
   outcome: z.enum(["completed", "failed"]),
   errorCode: identifier.optional(),
+  retryable: z.boolean().default(false),
 });
 
 export const outboundMessageSchema = z.object({
+  tenantId,
   channelId: identifier,
+  accountId: identifier,
   conversationId: identifier,
+  senderId: identifier,
   correlationId: identifier,
   text: z.string().max(64_000),
 });
 
 export const bindingSchema = z.object({
+  tenantId,
   channelId: identifier,
+  accountId: identifier,
   conversationId: identifier,
+  senderId: identifier,
   sessionId: identifier,
   workspaceAlias: z
     .string()
@@ -66,19 +84,16 @@ export const workspaceAliasSchema = z.object({
 });
 
 export const allowedSenderSchema = z.object({
+  tenantId,
   channelId: identifier,
+  accountId: identifier,
   senderId: identifier,
   displayName: z.string().min(1).max(200).optional(),
 });
 
 export const approvalRequestSchema = z.object({
   requestId: identifier,
-  identity: z.object({
-    channelId: identifier,
-    conversationId: identifier,
-    senderId: identifier,
-    sessionId: identifier,
-  }),
+  identity: routeIdentity.extend({ sessionId: identifier }),
   scope: z.object({
     kind: identifier,
     summary: z.string().min(1).max(2000),
@@ -92,17 +107,13 @@ export const approvalRequestSchema = z.object({
 export const approvalDecisionSchema = z.object({
   nonce: z.string().min(16).max(200),
   decision: z.enum(["approved", "denied"]),
-  identity: z.object({
-    channelId: identifier,
-    conversationId: identifier,
-    senderId: identifier,
-    sessionId: identifier,
-  }),
+  identity: routeIdentity.extend({ sessionId: identifier }),
 });
 
 export const approvalConsumeSchema = z.object({
   requestId: identifier,
-  sessionId: identifier,
+  identity: routeIdentity.extend({ sessionId: identifier }),
+  operationDigest: z.string().length(64).regex(/^[a-f0-9]+$/),
 });
 
 export const adminApprovalDecisionSchema = z.object({

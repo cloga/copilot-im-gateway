@@ -4,10 +4,15 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import path from "node:path";
-import { GatewayError, gatewayErrorCodes } from "./errors.js";
+import {
+  canonicalizeIdentityComponents,
+  type TenantId,
+} from "./contracts.js";
 
 export interface RemoteIdentity {
+  tenantId: TenantId;
   channelId: string;
+  accountId: string;
   conversationId: string;
   senderId: string;
   sessionId: string;
@@ -37,8 +42,42 @@ export function createApprovalNonce(): string {
   return randomBytes(18).toString("base64url");
 }
 
-export function hashSecret(value: string): string {
-  return createHash("sha256").update(value, "utf8").digest("hex");
+export function hashSecret(value: string, label = "secret"): string {
+  return createHash("sha256")
+    .update(`${Buffer.byteLength(label, "utf8")}:${label}`)
+    .update(`${Buffer.byteLength(value, "utf8")}:${value}`)
+    .digest("hex");
+}
+
+export function digestPermissionScope(scope: PermissionScope): string {
+  return hashSecret(
+    canonicalizeIdentityComponents([
+      scope.kind,
+      "paths",
+      String(scope.paths.length),
+      ...[...scope.paths].sort(),
+      "hosts",
+      String(scope.hosts.length),
+      ...[...scope.hosts].sort(),
+      "commands",
+      String(scope.commands.length),
+      ...[...scope.commands].sort(),
+    ]),
+    "approval-scope",
+  );
+}
+
+export function digestApprovalOperation(
+  requestId: string,
+  scope: PermissionScope,
+): string {
+  return hashSecret(
+    canonicalizeIdentityComponents([
+      requestId,
+      digestPermissionScope(scope),
+    ]),
+    "approval-operation",
+  );
 }
 
 export function constantTimeTokenEqual(
@@ -110,34 +149,6 @@ export function chunkOutboundText(
     chunks.push(remaining);
   }
   return chunks;
-}
-
-export class SlidingWindowRateLimiter {
-  readonly #events = new Map<string, number[]>();
-
-  constructor(
-    private readonly limit: number,
-    private readonly windowMs: number,
-    private readonly clock: Clock = systemClock,
-  ) {}
-
-  consume(key: string): void {
-    const now = this.clock.now().getTime();
-    const cutoff = now - this.windowMs;
-    const events = (this.#events.get(key) ?? []).filter(
-      (timestamp) => timestamp > cutoff,
-    );
-    if (events.length >= this.limit) {
-      throw new GatewayError({
-        code: gatewayErrorCodes.rateLimited,
-        message: "Message rate limit exceeded.",
-        retryable: true,
-        status: 429,
-      });
-    }
-    events.push(now);
-    this.#events.set(key, events);
-  }
 }
 
 export function canonicalizeWorkspace(candidate: string): string {
