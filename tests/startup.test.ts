@@ -21,6 +21,7 @@ import {
 import { GatewayService } from "../src/daemon/gateway.js";
 import {
   bootstrapGateway,
+  lifecycleOptionsFromEnvironment,
   parseGatewayPort,
 } from "../src/daemon/startup.js";
 import {
@@ -117,11 +118,13 @@ function createLegacyV1Database(databasePath: string): void {
 function pathsFor(directory: string): {
   dataDirectory: string;
   databasePath: string;
+  keyPath: string;
   tokenPath: string;
 } {
   return {
     dataDirectory: directory,
     databasePath: path.join(directory, "gateway.sqlite"),
+    keyPath: path.join(directory, "credential-master-key"),
     tokenPath: path.join(directory, "auth-token"),
   };
 }
@@ -280,6 +283,33 @@ describe("gateway startup", () => {
     }
   });
 
+  it("parses bounded sensitive-data lifecycle settings", () => {
+    expect(lifecycleOptionsFromEnvironment({})).toEqual({
+      completedBodyRetentionHours: 24,
+      failedBodyRetentionHours: 72,
+      contextTokenRetentionDays: 7,
+      cleanupBatchSize: 500,
+    });
+    expect(
+      lifecycleOptionsFromEnvironment({
+        COPILOT_IM_GATEWAY_COMPLETED_BODY_HOURS: "2",
+        COPILOT_IM_GATEWAY_FAILED_BODY_HOURS: "4",
+        COPILOT_IM_GATEWAY_CONTEXT_TOKEN_DAYS: "3",
+        COPILOT_IM_GATEWAY_CLEANUP_BATCH_SIZE: "10",
+      }),
+    ).toEqual({
+      completedBodyRetentionHours: 2,
+      failedBodyRetentionHours: 4,
+      contextTokenRetentionDays: 3,
+      cleanupBatchSize: 10,
+    });
+    expect(() =>
+      lifecycleOptionsFromEnvironment({
+        COPILOT_IM_GATEWAY_CONTEXT_TOKEN_DAYS: "31",
+      }),
+    ).toThrow("COPILOT_IM_GATEWAY_CONTEXT_TOKEN_DAYS");
+  });
+
   it("serves not-ready until the reserved listener is activated", async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "gateway-reserve-"));
     cleanups.push(() => rmSync(directory, { force: true, recursive: true }));
@@ -368,7 +398,7 @@ describe("gateway startup", () => {
           user_version: number;
         }
       ).user_version,
-    ).toBe(3);
+    ).toBe(4);
     expect(
       migrated
         .prepare(
@@ -420,7 +450,9 @@ describe("gateway startup", () => {
 
     const reservation = await reserveGatewayHttpServer(port);
     await reservation.close();
-    const reopened = new GatewayStore(paths.databasePath);
+    const reopened = new GatewayStore(paths.databasePath, {
+      secretKey: readFileSync(paths.keyPath),
+    });
     reopened.close();
   });
 

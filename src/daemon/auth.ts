@@ -13,6 +13,7 @@ import { createBearerToken } from "../core/security.js";
 export interface GatewayPaths {
   dataDirectory: string;
   databasePath: string;
+  keyPath: string;
   tokenPath: string;
 }
 
@@ -30,6 +31,7 @@ export function resolveGatewayPaths(
   return {
     dataDirectory,
     databasePath: path.join(dataDirectory, "gateway.sqlite"),
+    keyPath: path.join(dataDirectory, "credential-master-key"),
     tokenPath,
   };
 }

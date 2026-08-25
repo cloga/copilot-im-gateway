@@ -17,6 +17,27 @@ $extensionDirectory = Join-Path $root "extension"
 $dataDirectory = Join-Path $root "data"
 $daemon = $null
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $stream = $null
+    $hasher = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        $hasher = [System.Security.Cryptography.SHA256]::Create()
+        $hash = $hasher.ComputeHash($stream)
+        return [BitConverter]::ToString($hash).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        if ($null -ne $hasher) {
+            $hasher.Dispose()
+        }
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
 function Wait-ForHealth {
     param([int]$Port)
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -73,6 +94,7 @@ try {
         "app\daemon-runtime-closure.json",
         "app\dist\daemon\main.js",
         "app\node_modules\zod\package.json",
+        "credential-key.ps1",
         "start-daemon.cmd",
         "unins000.exe"
     )) {
@@ -105,6 +127,19 @@ try {
     $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
     $listener.Stop()
 
+    $keyHelper = Join-Path $installDirectory "credential-key.ps1"
+    & powershell.exe `
+        -NoProfile `
+        -NonInteractive `
+        -ExecutionPolicy Bypass `
+        -File $keyHelper `
+        -DataDirectory $dataDirectory
+    if ($LASTEXITCODE -ne 0) {
+        throw "Credential key provisioning failed."
+    }
+    $keyPath = Join-Path $dataDirectory "credential-master-key"
+    $keyHashBeforeUpgrade = Get-Sha256Hex -Path $keyPath
+
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = Join-Path $installDirectory "runtime\node.exe"
     $startInfo.Arguments = '"' + (Join-Path $installDirectory "app\dist\daemon\main.js") + '"'
@@ -112,8 +147,12 @@ try {
     $startInfo.UseShellExecute = $false
     $startInfo.Environment["COPILOT_IM_GATEWAY_DATA_DIR"] = $dataDirectory
     $startInfo.Environment["COPILOT_IM_GATEWAY_PORT"] = [string]$port
+    $startInfo.Environment["COPILOT_IM_GATEWAY_WINDOWS_KEY_ACL"] = "operator-only-v1"
     $daemon = [Diagnostics.Process]::Start($startInfo)
     Wait-ForHealth -Port $port
+    if ((Get-Sha256Hex -Path $keyPath) -ne $keyHashBeforeUpgrade) {
+        throw "Upgrade did not reuse the existing credential master key."
+    }
 
     try {
         Invoke-WebRequest -Uri "http://127.0.0.1:$port/v1/status" -UseBasicParsing | Out-Null
@@ -178,6 +217,12 @@ finally {
     }
     if (Test-Path -LiteralPath $extensionDirectory) {
         throw "Uninstaller did not remove the installed extension directory."
+    }
+    if (-not (Test-Path -LiteralPath $dataDirectory -PathType Container)) {
+        throw "Uninstaller silently removed gateway user data."
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $dataDirectory "credential-master-key") -PathType Leaf)) {
+        throw "Uninstaller silently removed the credential master key."
     }
     if (Test-Path -LiteralPath $root) {
         Remove-Item -LiteralPath $root -Recurse -Force

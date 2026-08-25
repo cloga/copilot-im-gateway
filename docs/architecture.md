@@ -71,7 +71,14 @@ admission dispositions, ownership and work leases, and audit events. Message IDs
 are idempotent per full route. `BEGIN IMMEDIATE` couples state transitions with
 their audit records. Durable sequence numbers prevent retrying work from being
 overtaken after restart. Terminal inbox metadata and audit data default to
-14-day and 30-day retention respectively.
+14-day and 30-day retention respectively; completed and failed bodies are
+scrubbed after 24 and 72 hours, and sensitive channel context expires after
+seven days.
+
+Channel state is stored as versioned AES-256-GCM envelopes whose associated data
+binds tenant, channel, account, state key, and schema version. Public account
+labels are separate from encrypted credentials. The master key is a protected
+file outside SQLite, and schema migration and offline rotation are restart-safe.
 
 Startup first binds the configured port on `127.0.0.1`. The same HTTP server
 holds that listener while SQLite is opened and migrated, returns `503` until

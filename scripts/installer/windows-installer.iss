@@ -40,6 +40,7 @@ Source: "{#StageDir}\extension\*"; DestDir: "{code:GetExtensionDir}"; Flags: ign
 Source: "{#StageDir}\start-daemon.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\open-status.cmd"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#StageDir}\stop-daemon.ps1"; Flags: dontcopy
+Source: "{#StageDir}\credential-key.ps1"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\Copilot IM Gateway\Start Copilot IM Gateway"; Filename: "{app}\start-daemon.cmd"; WorkingDir: "{app}\app"

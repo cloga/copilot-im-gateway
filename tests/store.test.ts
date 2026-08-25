@@ -1,4 +1,9 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -1003,6 +1008,150 @@ describe("GatewayStore durable runtime state", () => {
     store.close();
   });
 
+  it("retains expired context for active backlog and removes it after terminal completion", () => {
+    const clock = new MutableClock();
+    const databasePath = createDatabasePath();
+    const store = createStore(databasePath, {
+      clock,
+      cleanupBatchSize: 1,
+      completedBodyRetentionHours: 1,
+      failedBodyRetentionHours: 2,
+      contextTokenRetentionDays: 7,
+      inboxRetentionDays: 30,
+      auditRetentionDays: 30,
+    });
+    configure(store);
+    admit(store, message("completed", identity(), "completed body"));
+    admit(store, message("failed", identity(), "failed body"));
+    admit(store, message("pending", identity(), "pending body"));
+    let leased = store.leaseInbound(
+      "session",
+      clock.now().toISOString(),
+      60,
+    );
+    store.completeInbound(
+      leased?.id ?? 0,
+      leased?.leaseId ?? "",
+      "completed",
+      undefined,
+      false,
+      clock.now().toISOString(),
+    );
+    leased = store.leaseInbound("session", clock.now().toISOString(), 60);
+    store.completeInbound(
+      leased?.id ?? 0,
+      leased?.leaseId ?? "",
+      "failed",
+      "TERMINAL",
+      false,
+      clock.now().toISOString(),
+    );
+    store.setChannelState(
+      {
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot-a",
+      },
+      "context:conversation",
+      "fixture-context-token",
+      clock.now().toISOString(),
+    );
+
+    clock.advance(90 * 60 * 1_000);
+    store.renewOwnership();
+    expect(store.cleanup(clock.now().toISOString())).toMatchObject({
+      bodies: 1,
+      hasMore: true,
+    });
+    let inspection = new DatabaseSync(databasePath);
+    expect(
+      inspection
+        .prepare("SELECT status, text FROM inbound_messages ORDER BY id")
+        .all(),
+    ).toEqual([
+      { status: "completed", text: "" },
+      { status: "failed", text: "failed body" },
+      { status: "pending", text: "pending body" },
+    ]);
+    inspection.close();
+
+    leased = store.leaseInbound(
+      "session",
+      clock.now().toISOString(),
+      60,
+    );
+    store.completeInbound(
+      leased?.id ?? 0,
+      leased?.leaseId ?? "",
+      "failed",
+      "TRANSIENT",
+      true,
+      clock.now().toISOString(),
+    );
+    clock.advance(8 * 24 * 60 * 60 * 1_000);
+    store.renewOwnership();
+    expect(store.cleanup(clock.now().toISOString())).toMatchObject({
+      bodies: 1,
+      channelState: 0,
+    });
+    expect(
+      store.getChannelState(
+        {
+          tenantId: "local",
+          channelId: "weixin-main",
+          accountId: "bot-a",
+        },
+        "context:conversation",
+      ),
+    ).toBe("fixture-context-token");
+    leased = store.leaseInbound(
+      "session",
+      clock.now().toISOString(),
+      60,
+    );
+    store.completeInbound(
+      leased?.id ?? 0,
+      leased?.leaseId ?? "",
+      "completed",
+      undefined,
+      false,
+      clock.now().toISOString(),
+    );
+    expect(store.cleanup(clock.now().toISOString())).toMatchObject({
+      channelState: 1,
+    });
+    expect(
+      store.getChannelState(
+        {
+          tenantId: "local",
+          channelId: "weixin-main",
+          accountId: "bot-a",
+        },
+        "context:conversation",
+      ),
+    ).toBeUndefined();
+    for (const statePath of [databasePath, `${databasePath}-wal`]) {
+      if (existsSync(statePath)) {
+        const contents = readFileSync(statePath);
+        expect(contents.includes(Buffer.from("completed body"))).toBe(false);
+        expect(contents.includes(Buffer.from("failed body"))).toBe(false);
+        expect(contents.includes(Buffer.from("fixture-context-token"))).toBe(
+          false,
+        );
+      }
+    }
+    inspection = new DatabaseSync(databasePath);
+    expect(
+      inspection
+        .prepare(
+          "SELECT status FROM inbound_messages WHERE message_id = 'pending'",
+        )
+        .get(),
+    ).toEqual({ status: "completed" });
+    inspection.close();
+    store.close();
+  });
+
   it("renews a matching owner after a clock stall and rejects it after takeover", () => {
     const clock = new MutableClock();
     const databasePath = createDatabasePath();
@@ -1070,7 +1219,7 @@ describe("GatewayStore durable runtime state", () => {
           user_version: number;
         }
       ).user_version,
-    ).toBe(3);
+    ).toBe(4);
     expect(
       (
         upgraded.prepare("PRAGMA table_info(inbound_admissions)").all() as Array<{

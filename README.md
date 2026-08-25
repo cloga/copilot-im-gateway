@@ -55,7 +55,11 @@ TypeScript.
 4. Open **Start Copilot IM Gateway** from the Start Menu. The installer does not
    configure persistent auto-start.
 5. Use **Gateway status** to open the unauthenticated local health endpoint.
-   Uninstall from Windows Installed Apps or the Start Menu shortcut.
+   Uninstall from Windows Installed Apps or the Start Menu shortcut. Uninstall
+   removes application and extension files but deliberately preserves
+   `%USERPROFILE%\.copilot-im-gateway`, including the encrypted database and
+   credential key. To erase them, first uninstall and then explicitly delete
+   that data directory while signed in as its owner.
 
 > [!WARNING]
 > The initial Windows Setup EXE is not code-signed. Windows SmartScreen may show
@@ -87,11 +91,19 @@ replacement by reading its local bearer-token file without displaying or
 copying the credential. An upgrade aborts before replacement if authenticated
 v2 shutdown is unavailable; exit the old Copilot IM Gateway and retry.
 
-The first daemon start creates a local bearer token in the data directory with
-owner-only permissions where supported. Inspect the startup message for the
-token file path; the token itself is never printed. Set
+The first daemon start creates a local bearer token and a separate random
+credential master key in the data directory. Sensitive iLink channel state is
+stored in SQLite only as authenticated ciphertext. POSIX uses owner-only
+permissions; Windows Setup verifies an operator-only ACL for the current SID.
+Neither secret is printed. Set
 `COPILOT_IM_GATEWAY_TOKEN_FILE` for the extension if using a non-default data
 directory.
+
+For offline key rotation, stop the daemon. On Windows, dot-source
+`credential-key.ps1 -DataDirectory <path> -ProvisionNext`; on POSIX the
+maintenance command creates the protected next key. Then run
+`node dist/daemon/maintenance.js rotate-credential-key <path>`. Restart
+recovery deterministically completes or rolls back an interrupted rotation.
 
 See [docs/development.md](docs/development.md) for setup and verification,
 [docs/architecture.md](docs/architecture.md) for design invariants, and

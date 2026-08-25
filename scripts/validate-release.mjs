@@ -23,6 +23,7 @@ export const requiredEntries = [
   "package/.github/extensions/im-gateway/gateway-client.mjs",
   "package/README.md",
   "package/THIRD_PARTY_NOTICES.md",
+  "package/credential-key.ps1",
   `package/${daemonRuntimeManifest}`,
   "package/dist/daemon/main.js",
   "package/docs/manual-smoke-test.md",
@@ -166,6 +167,14 @@ function readArchive(archivePath) {
 export async function validateReleaseArchive(archivePath, checksumPath) {
   const archiveEntries = readArchive(archivePath);
   const entries = new Set(archiveEntries.keys());
+  const forbiddenState = [...entries].filter((entry) =>
+    /(?:^|\/)(?:auth-token|credential-master-key(?:\..*)?|gateway\.sqlite(?:-.*)?)$/u
+      .test(entry));
+  if (forbiddenState.length > 0) {
+    throw new Error(
+      `Release archive contains generated credential state: ${forbiddenState.join(", ")}`,
+    );
+  }
   const missing = requiredEntries.filter((entry) => !entries.has(entry));
   if (missing.length > 0) {
     throw new Error(`Release archive is missing: ${missing.join(", ")}`);
