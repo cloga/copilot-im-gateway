@@ -17,6 +17,27 @@ $extensionDirectory = Join-Path $root "extension"
 $dataDirectory = Join-Path $root "data"
 $daemon = $null
 
+function Get-Sha256Hex {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $stream = $null
+    $hasher = $null
+    try {
+        $stream = [System.IO.File]::OpenRead($Path)
+        $hasher = [System.Security.Cryptography.SHA256]::Create()
+        $hash = $hasher.ComputeHash($stream)
+        return [BitConverter]::ToString($hash).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        if ($null -ne $hasher) {
+            $hasher.Dispose()
+        }
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+}
+
 function Wait-ForHealth {
     param([int]$Port)
     $deadline = [DateTime]::UtcNow.AddSeconds(30)
@@ -117,7 +138,7 @@ try {
         throw "Credential key provisioning failed."
     }
     $keyPath = Join-Path $dataDirectory "credential-master-key"
-    $keyHashBeforeUpgrade = (Get-FileHash -LiteralPath $keyPath -Algorithm SHA256).Hash
+    $keyHashBeforeUpgrade = Get-Sha256Hex -Path $keyPath
 
     $startInfo = [Diagnostics.ProcessStartInfo]::new()
     $startInfo.FileName = Join-Path $installDirectory "runtime\node.exe"
@@ -129,7 +150,7 @@ try {
     $startInfo.Environment["COPILOT_IM_GATEWAY_WINDOWS_KEY_ACL"] = "operator-only-v1"
     $daemon = [Diagnostics.Process]::Start($startInfo)
     Wait-ForHealth -Port $port
-    if ((Get-FileHash -LiteralPath $keyPath -Algorithm SHA256).Hash -ne $keyHashBeforeUpgrade) {
+    if ((Get-Sha256Hex -Path $keyPath) -ne $keyHashBeforeUpgrade) {
         throw "Upgrade did not reuse the existing credential master key."
     }
 

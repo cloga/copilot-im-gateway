@@ -629,6 +629,25 @@ describe("release packaging", () => {
     expect(installer).not.toContain("TryStrToInt");
     expect(releaseWorkflow).toContain("npm run release:installer:smoke");
     expect(releaseWorkflow).toContain("release/*.exe");
+    expect(installerSmoke).not.toContain("Get-FileHash");
+    expect(installerSmoke).toContain(
+      "$stream = [System.IO.File]::OpenRead($Path)",
+    );
+    expect(installerSmoke).toContain(
+      "$hasher = [System.Security.Cryptography.SHA256]::Create()",
+    );
+    expect(installerSmoke).toContain("$hash = $hasher.ComputeHash($stream)");
+    expect(installerSmoke).toContain(
+      '[BitConverter]::ToString($hash).Replace("-", "").ToLowerInvariant()',
+    );
+    expect(installerSmoke).toContain("$hasher.Dispose()");
+    expect(installerSmoke).toContain("$stream.Dispose()");
+    expect(installerSmoke).toContain(
+      "$keyHashBeforeUpgrade = Get-Sha256Hex -Path $keyPath",
+    );
+    expect(installerSmoke).toContain(
+      "if ((Get-Sha256Hex -Path $keyPath) -ne $keyHashBeforeUpgrade)",
+    );
     expect(installScript).toContain(
       "$nodeVersion.Major -eq 22 -and $nodeVersion.Minor -ge 13",
     );
