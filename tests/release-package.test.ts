@@ -1,4 +1,8 @@
-import { spawnSync } from "node:child_process";
+import {
+  type ChildProcess,
+  spawn,
+  spawnSync,
+} from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   mkdir,
@@ -7,6 +11,7 @@ import {
   rm,
   writeFile,
 } from "node:fs/promises";
+import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -16,8 +21,12 @@ import {
   writeChecksum,
 } from "../scripts/package-release.mjs";
 import {
+  collectFilesystemEsmClosure,
+  daemonRuntimeEntrypoint,
   daemonRuntimeManifest,
+  esmClosureManifestVersion,
   findRelativeEsmSpecifiers,
+  parseEsmClosureManifest,
   writeEsmClosureManifest,
 } from "../scripts/release/esm-closure.mjs";
 import {
@@ -65,6 +74,80 @@ async function createReleaseFixture(
     stage,
     path.join(stage, daemonRuntimeManifest),
   );
+}
+
+async function rewriteClosureManifest(
+  stage: string,
+  changes: {
+    entrypoint?: string;
+    files?: string[];
+    version?: number;
+  },
+): Promise<void> {
+  const manifestPath = path.join(stage, daemonRuntimeManifest);
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as {
+    entrypoint: string;
+    files: string[];
+    version: number;
+  };
+  await writeFile(
+    manifestPath,
+    `${JSON.stringify({ ...manifest, ...changes }, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+async function availablePort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string") {
+    throw new Error("Test listener did not receive a TCP port.");
+  }
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    });
+  });
+  return address.port;
+}
+
+async function waitForFile(filePath: string): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    try {
+      await readFile(filePath);
+      return;
+    } catch (error) {
+      if (
+        !(error instanceof Error) ||
+        !("code" in error) ||
+        error.code !== "ENOENT"
+      ) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  throw new Error(`Timed out waiting for ${filePath}.`);
+}
+
+async function stopTestProcess(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  const exited = new Promise<void>((resolve) => {
+    child.once("exit", () => resolve());
+  });
+  child.kill();
+  await exited;
 }
 
 describe("release packaging", () => {
@@ -122,6 +205,144 @@ describe("release packaging", () => {
       "./result.js",
       "./side-effect.js",
     ]);
+  });
+
+  it("requires the supported canonical daemon closure manifest contract", () => {
+    const valid = {
+      version: esmClosureManifestVersion,
+      entrypoint: daemonRuntimeEntrypoint,
+      files: [
+        "dist/channels/weixin/adapter.js",
+        daemonRuntimeEntrypoint,
+        "dist/daemon/store.js",
+      ],
+    };
+    expect(parseEsmClosureManifest(valid)).toEqual(valid);
+    expect(() =>
+      parseEsmClosureManifest({
+        ...valid,
+        version: esmClosureManifestVersion + 1,
+      }),
+    ).toThrow("version");
+    expect(() =>
+      parseEsmClosureManifest({
+        ...valid,
+        entrypoint: "README.md",
+        files: ["README.md"],
+      }),
+    ).toThrow(`entrypoint must be ${daemonRuntimeEntrypoint}`);
+    expect(() =>
+      parseEsmClosureManifest({
+        ...valid,
+        files: ["./dist/daemon/main.js"],
+      }),
+    ).toThrow("non-canonical");
+    expect(() =>
+      parseEsmClosureManifest({
+        ...valid,
+        files: [daemonRuntimeEntrypoint, daemonRuntimeEntrypoint],
+      }),
+    ).toThrow("unique, sorted");
+  });
+
+  it("resolves relative imports as canonical package file URLs", async () => {
+    const root = await mkdtemp(
+      path.join(os.tmpdir(), "copilot-im-gateway-url-closure-"),
+    );
+    const mainPath = path.join(root, "dist", "daemon", "main.js");
+    try {
+      await mkdir(path.dirname(mainPath), { recursive: true });
+      await mkdir(path.join(root, "dist", "daemon", "nested"), {
+        recursive: true,
+      });
+      await Promise.all([
+        writeFile(
+          path.join(root, "dist", "daemon", "store.js"),
+          "export {};\n",
+          "utf8",
+        ),
+        writeFile(
+          path.join(root, "dist", "daemon", "nested", "decoy.js"),
+          "export {};\n",
+          "utf8",
+        ),
+        writeFile(
+          path.join(root, "dist", "decoy.js"),
+          "export {};\n",
+          "utf8",
+        ),
+        writeFile(path.join(root, "README.md"), "decoy\n", "utf8"),
+      ]);
+
+      await writeFile(
+        mainPath,
+        [
+          'import "./store.js";',
+          'import "zod";',
+          'import "node:fs";',
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      await expect(
+        collectFilesystemEsmClosure(root, daemonRuntimeEntrypoint),
+      ).resolves.toEqual([
+        daemonRuntimeEntrypoint,
+        "dist/daemon/store.js",
+      ]);
+
+      for (const specifier of [
+        "./%2e%2e/decoy.js",
+        "./nested%2fdecoy.js",
+        "./nested%2Fdecoy.js",
+        "./nested%5cdecoy.js",
+        "./bad%00.js",
+      ]) {
+        await writeFile(mainPath, `import ${JSON.stringify(specifier)};\n`);
+        await expect(
+          collectFilesystemEsmClosure(root, daemonRuntimeEntrypoint),
+        ).rejects.toThrow("unsafe");
+      }
+
+      for (const specifier of [
+        "./store.js?raw",
+        "./store.js#fragment",
+        "#package-import",
+      ]) {
+        await writeFile(mainPath, `import ${JSON.stringify(specifier)};\n`);
+        await expect(
+          collectFilesystemEsmClosure(root, daemonRuntimeEntrypoint),
+        ).rejects.toThrow("query strings and fragments");
+      }
+
+      for (const specifier of [
+        "https://example.invalid/decoy.js",
+        "data:text/javascript,export default 1",
+      ]) {
+        await writeFile(mainPath, `import ${JSON.stringify(specifier)};\n`);
+        await expect(
+          collectFilesystemEsmClosure(root, daemonRuntimeEntrypoint),
+        ).rejects.toThrow("file URL");
+      }
+
+      for (const specifier of [
+        " data:text/javascript,export default 1",
+        "\tfile:///outside.js",
+        "file:///outside.js\n",
+      ]) {
+        await writeFile(mainPath, `import ${JSON.stringify(specifier)};\n`);
+        await expect(
+          collectFilesystemEsmClosure(root, daemonRuntimeEntrypoint),
+        ).rejects.toThrow("unsafe");
+      }
+
+      await writeFile(mainPath, 'import "../../../README.md";\n');
+      await expect(
+        collectFilesystemEsmClosure(root, daemonRuntimeEntrypoint),
+      ).rejects.toThrow("escapes its package root");
+    } finally {
+      await rm(root, { force: true, recursive: true });
+    }
   });
 
   it("rejects a repository without compiled daemon output", async () => {
@@ -189,11 +410,26 @@ describe("release packaging", () => {
     const incompleteStage = path.join(root, "incomplete");
     const missingStoreStage = path.join(root, "missing-store");
     const missingChannelStage = path.join(root, "missing-channel");
+    const readmeEntrypointStage = path.join(root, "readme-entrypoint");
+    const packageEntrypointStage = path.join(root, "package-entrypoint");
+    const unsupportedVersionStage = path.join(root, "unsupported-version");
     const firstArchive = path.join(root, "first.zip");
     const secondArchive = path.join(root, "second.zip");
     const incompleteArchive = path.join(root, "incomplete.zip");
     const missingStoreArchive = path.join(root, "missing-store.zip");
     const missingChannelArchive = path.join(root, "missing-channel.zip");
+    const readmeEntrypointArchive = path.join(
+      root,
+      "readme-entrypoint.zip",
+    );
+    const packageEntrypointArchive = path.join(
+      root,
+      "package-entrypoint.zip",
+    );
+    const unsupportedVersionArchive = path.join(
+      root,
+      "unsupported-version.zip",
+    );
     try {
       await Promise.all([
         createReleaseFixture(firstStage),
@@ -204,6 +440,9 @@ describe("release packaging", () => {
         ),
         createReleaseFixture(missingStoreStage),
         createReleaseFixture(missingChannelStage),
+        createReleaseFixture(readmeEntrypointStage),
+        createReleaseFixture(packageEntrypointStage),
+        createReleaseFixture(unsupportedVersionStage),
       ]);
       await Promise.all([
         rm(path.join(missingStoreStage, "dist", "daemon", "store.js")),
@@ -216,16 +455,54 @@ describe("release packaging", () => {
             "adapter.js",
           ),
         ),
+        rewriteClosureManifest(readmeEntrypointStage, {
+          entrypoint: "README.md",
+          files: ["README.md"],
+        }),
+        rewriteClosureManifest(packageEntrypointStage, {
+          entrypoint: "package.json",
+          files: ["package.json"],
+        }),
+        rewriteClosureManifest(unsupportedVersionStage, {
+          version: esmClosureManifestVersion + 1,
+        }),
       ]);
 
-      await createDeterministicZip(firstStage, firstArchive);
-      await createDeterministicZip(secondStage, secondArchive);
-      await createDeterministicZip(missingStoreStage, missingStoreArchive);
-      await createDeterministicZip(missingChannelStage, missingChannelArchive);
-      const firstChecksum = await writeChecksum(firstArchive);
-      const secondChecksum = await writeChecksum(secondArchive);
-      const missingStoreChecksum = await writeChecksum(missingStoreArchive);
-      const missingChannelChecksum = await writeChecksum(missingChannelArchive);
+      await Promise.all([
+        createDeterministicZip(firstStage, firstArchive),
+        createDeterministicZip(secondStage, secondArchive),
+        createDeterministicZip(missingStoreStage, missingStoreArchive),
+        createDeterministicZip(missingChannelStage, missingChannelArchive),
+        createDeterministicZip(
+          readmeEntrypointStage,
+          readmeEntrypointArchive,
+        ),
+        createDeterministicZip(
+          packageEntrypointStage,
+          packageEntrypointArchive,
+        ),
+        createDeterministicZip(
+          unsupportedVersionStage,
+          unsupportedVersionArchive,
+        ),
+      ]);
+      const [
+        firstChecksum,
+        secondChecksum,
+        missingStoreChecksum,
+        missingChannelChecksum,
+        readmeEntrypointChecksum,
+        packageEntrypointChecksum,
+        unsupportedVersionChecksum,
+      ] = await Promise.all([
+        writeChecksum(firstArchive),
+        writeChecksum(secondArchive),
+        writeChecksum(missingStoreArchive),
+        writeChecksum(missingChannelArchive),
+        writeChecksum(readmeEntrypointArchive),
+        writeChecksum(packageEntrypointArchive),
+        writeChecksum(unsupportedVersionArchive),
+      ]);
 
       await validateReleaseArchive(firstArchive, firstChecksum.checksumPath);
       await validateReleaseArchive(secondArchive, secondChecksum.checksumPath);
@@ -256,6 +533,26 @@ describe("release packaging", () => {
           missingChannelChecksum.checksumPath,
         ),
       ).rejects.toThrow("dist/channels/weixin/adapter.js");
+      await expect(
+        validateReleaseArchive(
+          readmeEntrypointArchive,
+          readmeEntrypointChecksum.checksumPath,
+        ),
+      ).rejects.toThrow(`entrypoint must be ${daemonRuntimeEntrypoint}`);
+      await expect(
+        validateReleaseArchive(
+          packageEntrypointArchive,
+          packageEntrypointChecksum.checksumPath,
+        ),
+      ).rejects.toThrow(`entrypoint must be ${daemonRuntimeEntrypoint}`);
+      await expect(
+        validateReleaseArchive(
+          unsupportedVersionArchive,
+          unsupportedVersionChecksum.checksumPath,
+        ),
+      ).rejects.toThrow(
+        `manifest version must be ${esmClosureManifestVersion}`,
+      );
 
       await writeFile(firstChecksum.checksumPath, "invalid  first.zip\n", "utf8");
       await expect(
@@ -321,18 +618,36 @@ describe("release packaging", () => {
       ),
     );
     expect(stopDaemonScript).toContain("Get-CimInstance Win32_Process");
-    expect(stopDaemonScript).toContain("Stop-Process -Id $processId");
-    expect(stopDaemonScript).toContain("Wait-Process -Id $processId");
     expect(stopDaemonScript).toContain("CommandLineToArgvW");
     expect(stopDaemonScript).toContain("Test-GatewayProcess");
-    expect(stopDaemonScript).toContain("Get-RevalidatedGatewayProcess");
     expect(stopDaemonScript).toContain("/v2/admin/shutdown");
+    expect(stopDaemonScript).toContain("/v2/admin/identity");
+    expect(stopDaemonScript).toContain("Get-HmacSha256Hex");
+    expect(stopDaemonScript).toContain('Authorization = "Bearer $BearerToken"');
     expect(stopDaemonScript).toContain(
-      "Start-Sleep -Seconds $FallbackLeaseWaitSeconds",
+      "Exit the old Copilot IM Gateway and retry.",
     );
+    expect(
+      [
+        buildScript,
+        installScript,
+        installer,
+        stopDaemonScript,
+      ].join("\n"),
+    ).not.toContain("Stop-Process");
+    expect(stopDaemonScript).not.toContain("Wait-Process");
+    expect(stopDaemonScript).not.toContain("Get-NetTCPConnection");
+    expect(stopDaemonScript).not.toContain("FallbackLeaseWaitSeconds");
+    expect(stopDaemonScript).not.toContain("Get-RevalidatedGatewayProcess");
     expect(stopDaemonScript).not.toContain("$commandLine.IndexOf");
     expect(stopDaemonScript).toContain(
       "[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $Port)",
+    );
+    expect(installScript).toContain(
+      "Upgrade aborted before replacing installed files.",
+    );
+    expect(installer).toContain(
+      "Exit the old Copilot IM Gateway and retry.",
     );
     expect(installer).toContain("{param:GATEWAYDATADIR|}");
     expect(installer).toContain("{param:GATEWAYTOKENFILE|}");
@@ -346,6 +661,261 @@ describe("release packaging", () => {
       "Upgrade did not wait for loopback port release.",
     );
   });
+
+  it.skipIf(process.platform !== "win32")(
+    "does not disclose the token or trust shutdown responses from an unknown listener",
+    async () => {
+      const root = await mkdtemp(
+        path.join(os.tmpdir(), "copilot-im-gateway-unknown-stop-"),
+      );
+      const installDirectory = path.join(root, "install");
+      const dataDirectory = path.join(root, "data");
+      const tokenFile = path.join(dataDirectory, "auth-token");
+      const listenerScript = path.join(root, "unknown-listener.cjs");
+      const readyFile = path.join(root, "ready");
+      const requestFile = path.join(root, "request-received");
+      let listener: ChildProcess | undefined;
+      try {
+        await Promise.all([
+          mkdir(installDirectory, { recursive: true }),
+          mkdir(dataDirectory, { recursive: true }),
+        ]);
+        await Promise.all([
+          writeFile(
+            listenerScript,
+            [
+              'const http = require("node:http");',
+              'const fs = require("node:fs");',
+              "const port = Number(process.argv[2]);",
+              "const ready = process.argv[3];",
+              "const received = process.argv[4];",
+              "const server = http.createServer((_request, response) => {",
+              '  fs.writeFileSync(received, "received");',
+              '  response.writeHead(202, { "Content-Type": "application/json" });',
+              '  response.end(\'{"accepted":true}\');',
+              "});",
+              'server.listen(port, "127.0.0.1", () => {',
+              '  fs.writeFileSync(ready, "ready");',
+              "});",
+              "",
+            ].join("\n"),
+            "utf8",
+          ),
+          writeFile(tokenFile, `${"a".repeat(64)}\n`, "utf8"),
+        ]);
+        const port = await availablePort();
+        listener = spawn(
+          process.execPath,
+          [listenerScript, String(port), readyFile, requestFile],
+          { stdio: "ignore", windowsHide: true },
+        );
+        await waitForFile(readyFile);
+
+        const stopScript = path.resolve(
+          import.meta.dirname,
+          "..",
+          "scripts",
+          "release",
+          "stop-daemon.ps1",
+        );
+        const blocked = spawnSync(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            stopScript,
+            "-InstallDirectory",
+            installDirectory,
+            "-DataDirectory",
+            dataDirectory,
+            "-TokenFile",
+            tokenFile,
+            "-Port",
+            String(port),
+            "-TimeoutSeconds",
+            "2",
+          ],
+          {
+            encoding: "utf8",
+            timeout: 15_000,
+            windowsHide: true,
+          },
+        );
+        expect(
+          blocked.status,
+          `${blocked.stdout}\n${blocked.stderr}`,
+        ).not.toBe(0);
+        expect(
+          `${blocked.stdout}\n${blocked.stderr}`.replace(/\s+/gu, " "),
+        ).toContain(
+          "Exit the old Copilot IM Gateway",
+        );
+        expect(listener.exitCode).toBeNull();
+        await expect(readFile(requestFile, "utf8")).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } finally {
+        if (listener !== undefined) {
+          await stopTestProcess(listener);
+        }
+        await rm(root, { force: true, recursive: true });
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "leaves a legacy daemon and its data untouched until the user exits it",
+    async () => {
+      const root = await mkdtemp(
+        path.join(os.tmpdir(), "copilot-im-gateway-legacy-stop-"),
+      );
+      const installDirectory = path.join(root, "install");
+      const dataDirectory = path.join(root, "data");
+      const entrypoint = path.join(
+        installDirectory,
+        "app",
+        "dist",
+        "daemon",
+        "main.js",
+      );
+      const tokenFile = path.join(dataDirectory, "auth-token");
+      const sentinelFile = path.join(dataDirectory, "gateway.sqlite");
+      const readyFile = path.join(root, "ready");
+      const sentinel = Buffer.from([
+        0x53,
+        0x51,
+        0x4c,
+        0x69,
+        0x74,
+        0x65,
+        0x00,
+        0xff,
+      ]);
+      let legacy: ChildProcess | undefined;
+      try {
+        await Promise.all([
+          mkdir(path.dirname(entrypoint), { recursive: true }),
+          mkdir(dataDirectory, { recursive: true }),
+        ]);
+        await Promise.all([
+          writeFile(
+            entrypoint,
+            [
+              'const http = require("node:http");',
+              'const fs = require("node:fs");',
+              "const port = Number(process.argv[2]);",
+              "const ready = process.argv[3];",
+              "const server = http.createServer((_request, response) => {",
+              "  response.writeHead(404);",
+              '  response.end("legacy");',
+              "});",
+              'server.listen(port, "127.0.0.1", () => {',
+              '  fs.writeFileSync(ready, "ready");',
+              "});",
+              "",
+            ].join("\n"),
+            "utf8",
+          ),
+          writeFile(tokenFile, `${"a".repeat(64)}\n`, "utf8"),
+          writeFile(sentinelFile, sentinel),
+        ]);
+        const port = await availablePort();
+        legacy = spawn(
+          process.execPath,
+          [entrypoint, String(port), readyFile],
+          {
+            stdio: "ignore",
+            windowsHide: true,
+          },
+        );
+        await waitForFile(readyFile);
+
+        const stopScript = path.resolve(
+          import.meta.dirname,
+          "..",
+          "scripts",
+          "release",
+          "stop-daemon.ps1",
+        );
+        const stopArguments = [
+          "-NoProfile",
+          "-NonInteractive",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          stopScript,
+          "-InstallDirectory",
+          installDirectory,
+          "-DataDirectory",
+          dataDirectory,
+          "-TokenFile",
+          tokenFile,
+          "-Port",
+          String(port),
+          "-TimeoutSeconds",
+          "2",
+        ];
+        const blocked = spawnSync("powershell.exe", stopArguments, {
+          encoding: "utf8",
+          timeout: 15_000,
+          windowsHide: true,
+        });
+        expect(
+          blocked.status,
+          `${blocked.stdout}\n${blocked.stderr}`,
+        ).not.toBe(0);
+        expect(
+          `${blocked.stdout}\n${blocked.stderr}`.replace(/\s+/gu, " "),
+        ).toContain(
+          "Exit the old Copilot IM Gateway",
+        );
+        expect(legacy.exitCode).toBeNull();
+        expect(await readFile(sentinelFile)).toEqual(sentinel);
+
+        await stopTestProcess(legacy);
+        const unblocked = spawnSync("powershell.exe", stopArguments, {
+          encoding: "utf8",
+          timeout: 15_000,
+          windowsHide: true,
+        });
+        expect(
+          unblocked.status,
+          `${unblocked.stdout}\n${unblocked.stderr}`,
+        ).toBe(0);
+
+        await writeFile(
+          path.join(installDirectory, "upgrade-complete"),
+          "upgraded\n",
+          "utf8",
+        );
+        const restarted = createServer();
+        await new Promise<void>((resolve, reject) => {
+          restarted.once("error", reject);
+          restarted.listen(port, "127.0.0.1", resolve);
+        });
+        await new Promise<void>((resolve, reject) => {
+          restarted.close((error) => {
+            if (error) {
+              reject(error);
+            } else {
+              resolve();
+            }
+          });
+        });
+        expect(await readFile(sentinelFile)).toEqual(sentinel);
+      } finally {
+        if (legacy !== undefined) {
+          await stopTestProcess(legacy);
+        }
+        await rm(root, { force: true, recursive: true });
+      }
+    },
+    30_000,
+  );
 
   it.skipIf(process.platform !== "win32")(
     "selects only an exact tokenized Node daemon entrypoint",

@@ -118,11 +118,12 @@ validated recursive ESM closure manifest, and the complete extension directory
 in one package. Installer upgrades send an authenticated, empty-body
 `POST /v2/admin/shutdown`; the daemon acknowledges before asynchronously closing
 the listener, settling every channel stop, and releasing SQLite ownership.
-Upgrades wait for the exact process and loopback port to exit. A verified legacy
-Node daemon without that endpoint may be force-stopped only after command-line
-revalidation, followed by the full ownership-lease expiry delay. Startup binding
-remains the final fail-closed migration guard. Upgrade those artifacts together
-rather than copying an extension or daemon independently.
+Upgrades wait for the process and loopback port to exit. There is no process-kill
+fallback: a legacy daemon or unknown listener that cannot accept authenticated
+v2 shutdown aborts the upgrade before installed files or data are changed. The
+user must exit the old Copilot IM Gateway and retry. Startup binding remains the
+final fail-closed migration guard. Upgrade those artifacts together rather than
+copying an extension or daemon independently.
 
 ## Governance invariants
 

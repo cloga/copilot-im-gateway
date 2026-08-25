@@ -60,7 +60,12 @@ try {
     if ($PSBoundParameters.ContainsKey("Port")) {
         $stopParameters.Port = $Port
     }
-    & (Join-Path $PSScriptRoot "stop-daemon.ps1") @stopParameters
+    try {
+        & (Join-Path $PSScriptRoot "stop-daemon.ps1") @stopParameters
+    }
+    catch {
+        throw "Upgrade aborted before replacing installed files. $($_.Exception.Message)"
+    }
 
     if (Test-Path -LiteralPath $installDirectory) {
         Remove-Item -LiteralPath $installDirectory -Recurse -Force

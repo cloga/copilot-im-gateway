@@ -3,8 +3,7 @@ param(
     [string]$DataDirectory,
     [string]$TokenFile,
     [int]$Port = -1,
-    [ValidateRange(1, 300)][int]$TimeoutSeconds = 30,
-    [ValidateRange(16, 300)][int]$FallbackLeaseWaitSeconds = 16
+    [ValidateRange(1, 300)][int]$TimeoutSeconds = 30
 )
 
 $ErrorActionPreference = "Stop"
@@ -133,120 +132,110 @@ function Test-GatewayProcess {
     )
 }
 
-function Get-ProcessById {
-    param([Parameter(Mandatory = $true)][int]$ProcessId)
+function Test-InstalledGatewayProcess {
+    param([Parameter(Mandatory = $true)][string[]]$Entrypoints)
 
-    return Get-CimInstance Win32_Process `
-        -Filter "ProcessId = $ProcessId" `
-        -ErrorAction SilentlyContinue
-}
-
-function Get-RevalidatedGatewayProcess {
-    param(
-        [Parameter(Mandatory = $true)][object]$Candidate,
-        [Parameter(Mandatory = $true)][string[]]$Entrypoints
-    )
-
-    $processId = [int]$Candidate.ProcessId
-    $current = Get-ProcessById -ProcessId $processId
-    if ($null -eq $current) {
-        return $null
-    }
-    if (
-        [string]$current.CreationDate -ne [string]$Candidate.CreationDate -or
-        -not (Test-GatewayProcess -Process $current -Entrypoints $Entrypoints)
-    ) {
-        throw "Process $processId changed identity before shutdown; refusing to stop it."
-    }
-    return $current
-}
-
-function Get-LoopbackListeningPorts {
-    param([Parameter(Mandatory = $true)][int]$ProcessId)
-
-    return @(
-        Get-NetTCPConnection `
-            -OwningProcess $ProcessId `
-            -State Listen `
-            -ErrorAction SilentlyContinue |
-            Where-Object { $_.LocalAddress -eq "127.0.0.1" } |
-            ForEach-Object { [int]$_.LocalPort }
+    return $null -ne (
+        Get-CimInstance Win32_Process |
+            Where-Object {
+                Test-GatewayProcess -Process $_ -Entrypoints $Entrypoints
+            } |
+            Select-Object -First 1
     )
 }
 
 function Invoke-AuthenticatedGatewayShutdown {
     param(
-        [Parameter(Mandatory = $true)][int[]]$Ports,
+        [Parameter(Mandatory = $true)][int]$Port,
         [Parameter(Mandatory = $true)][string]$BearerToken
     )
 
-    $unsupportedResponses = 0
-    $failures = [Collections.Generic.List[string]]::new()
-    foreach ($candidatePort in $Ports) {
-        try {
-            $response = Invoke-WebRequest `
-                -Uri "http://127.0.0.1:$candidatePort/v2/admin/shutdown" `
-                -Method Post `
-                -Headers @{ Authorization = "Bearer $BearerToken" } `
-                -TimeoutSec 5 `
-                -UseBasicParsing
-            if ([int]$response.StatusCode -eq 202) {
-                return "Accepted"
-            }
-            [void]$failures.Add("port $candidatePort returned HTTP $([int]$response.StatusCode)")
-        }
-        catch {
-            $statusCode = $null
-            if (
-                $_.Exception.PSObject.Properties.Name -contains "Response" -and
-                $null -ne $_.Exception.Response
-            ) {
-                $statusCode = [int]$_.Exception.Response.StatusCode
-            }
-            if ($statusCode -in @(404, 405, 501)) {
-                $unsupportedResponses += 1
-            }
-            elseif ($null -eq $statusCode) {
-                [void]$failures.Add("port $candidatePort did not return an HTTP response")
-            }
-            else {
-                [void]$failures.Add("port $candidatePort returned HTTP $statusCode")
-            }
-        }
-    }
-
-    if ($unsupportedResponses -eq $Ports.Count) {
-        return "Unsupported"
-    }
-    throw "Authenticated gateway shutdown was not accepted: $($failures -join '; ')."
-}
-
-function Wait-ForExactProcessExit {
-    param(
-        [Parameter(Mandatory = $true)][object]$Candidate,
-        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
-    )
-
-    $processId = [int]$Candidate.ProcessId
     try {
-        Wait-Process -Id $processId -Timeout $TimeoutSeconds -ErrorAction Stop
+        $response = Invoke-WebRequest `
+            -Uri "http://127.0.0.1:$Port/v2/admin/shutdown" `
+            -Method Post `
+            -Headers @{ Authorization = "Bearer $BearerToken" } `
+            -TimeoutSec 5 `
+            -UseBasicParsing
+        return [int]$response.StatusCode -eq 202
     }
     catch {
-        $current = Get-ProcessById -ProcessId $processId
-        if (
-            $null -ne $current -and
-            [string]$current.CreationDate -eq [string]$Candidate.CreationDate
-        ) {
-            throw "Gateway daemon process $processId did not terminate."
-        }
+        return $false
     }
+}
 
-    $remaining = Get-ProcessById -ProcessId $processId
-    if (
-        $null -ne $remaining -and
-        [string]$remaining.CreationDate -eq [string]$Candidate.CreationDate
-    ) {
-        throw "Gateway daemon process $processId is still running."
+function Get-HmacSha256Hex {
+    param(
+        [Parameter(Mandatory = $true)][string]$BearerToken,
+        [Parameter(Mandatory = $true)][string]$Purpose,
+        [Parameter(Mandatory = $true)][string]$Challenge
+    )
+
+    $hmac = [Security.Cryptography.HMACSHA256]::new(
+        [Text.Encoding]::UTF8.GetBytes($BearerToken)
+    )
+    try {
+        $payload = [Text.Encoding]::UTF8.GetBytes(
+            $Purpose + [char]0 + $Challenge
+        )
+        return (
+            [BitConverter]::ToString($hmac.ComputeHash($payload))
+        ).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $hmac.Dispose()
+    }
+}
+
+function Test-AuthenticatedGatewayIdentity {
+    param(
+        [Parameter(Mandatory = $true)][int]$Port,
+        [Parameter(Mandatory = $true)][string]$BearerToken
+    )
+
+    $challengeBytes = New-Object byte[] 32
+    $random = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $random.GetBytes($challengeBytes)
+    }
+    finally {
+        $random.Dispose()
+    }
+    $challenge = (
+        [BitConverter]::ToString($challengeBytes)
+    ).Replace("-", "").ToLowerInvariant()
+    $requestProof = Get-HmacSha256Hex `
+        -BearerToken $BearerToken `
+        -Purpose "request" `
+        -Challenge $challenge
+    $expectedResponseProof = Get-HmacSha256Hex `
+        -BearerToken $BearerToken `
+        -Purpose "response" `
+        -Challenge $challenge
+
+    try {
+        $response = Invoke-WebRequest `
+            -Uri "http://127.0.0.1:$Port/v2/admin/identity" `
+            -Method Get `
+            -Headers @{
+                "X-Gateway-Shutdown-Challenge" = $challenge
+                "X-Gateway-Shutdown-Proof" = $requestProof
+            } `
+            -TimeoutSec 5 `
+            -UseBasicParsing
+        if ([int]$response.StatusCode -ne 200) {
+            return $false
+        }
+        $identity = $response.Content | ConvertFrom-Json
+        return (
+            [int]$identity.apiVersion -eq 2 -and
+            $null -ne $identity.capabilities -and
+            @($identity.capabilities) -contains "reservation-ownership" -and
+            [string]$identity.proof -ceq $expectedResponseProof
+        )
+    }
+    catch {
+        return $false
     }
 }
 
@@ -266,14 +255,19 @@ function Test-LoopbackPortAvailable {
     }
 }
 
+function Get-ManualExitMessage {
+    param([Parameter(Mandatory = $true)][string]$Reason)
+
+    return "$Reason Exit the old Copilot IM Gateway and retry."
+}
+
 function Invoke-StopGatewayDaemon {
     param(
         [Parameter(Mandatory = $true)][string]$InstallDirectory,
         [string]$DataDirectory,
         [string]$TokenFile,
         [int]$Port = -1,
-        [ValidateRange(1, 300)][int]$TimeoutSeconds = 30,
-        [ValidateRange(16, 300)][int]$FallbackLeaseWaitSeconds = 16
+        [ValidateRange(1, 300)][int]$TimeoutSeconds = 30
     )
 
     $resolvedInstallDirectory = [IO.Path]::GetFullPath($InstallDirectory)
@@ -317,83 +311,94 @@ function Invoke-StopGatewayDaemon {
         throw "Port must be an integer from 0 to 65535."
     }
 
-    $gatewayProcesses = @(
-        Get-CimInstance Win32_Process |
-            Where-Object {
-                Test-GatewayProcess -Process $_ -Entrypoints $entrypoints
-            }
-    )
-    if ($gatewayProcesses.Count -eq 0) {
+    try {
+        $gatewayDetected = Test-InstalledGatewayProcess -Entrypoints $entrypoints
+    }
+    catch {
+        throw (Get-ManualExitMessage `
+            -Reason "The upgrade guard could not inspect running gateway processes.")
+    }
+
+    if ($Port -eq 0) {
+        if ($gatewayDetected) {
+            throw (Get-ManualExitMessage `
+                -Reason "A gateway process is running on an automatically assigned port.")
+        }
+        return
+    }
+
+    if (Test-LoopbackPortAvailable -Port $Port) {
+        if ($gatewayDetected) {
+            throw (Get-ManualExitMessage `
+                -Reason "A gateway process is running outside the configured loopback port.")
+        }
         return
     }
 
     if (-not (Test-Path -LiteralPath $resolvedTokenFile -PathType Leaf)) {
-        throw "Gateway token file was not found; refusing unauthenticated process termination."
+        throw (Get-ManualExitMessage `
+            -Reason "The gateway token file was not found, so authenticated v2 shutdown is unavailable.")
     }
-    $bearerToken = (Get-Content -LiteralPath $resolvedTokenFile -Raw).Trim()
+    try {
+        $bearerToken = (Get-Content -LiteralPath $resolvedTokenFile -Raw).Trim()
+    }
+    catch {
+        throw (Get-ManualExitMessage `
+            -Reason "The gateway token file could not be read, so authenticated v2 shutdown is unavailable.")
+    }
     if ($bearerToken.Length -lt 32) {
-        throw "Gateway token file is invalid; refusing unauthenticated process termination."
+        throw (Get-ManualExitMessage `
+            -Reason "The gateway token file is invalid, so authenticated v2 shutdown is unavailable.")
     }
 
-    $portsToRelease = [Collections.Generic.HashSet[int]]::new()
-    foreach ($gatewayProcess in $gatewayProcesses) {
-        $processId = [int]$gatewayProcess.ProcessId
-        $listeningPorts = @(Get-LoopbackListeningPorts -ProcessId $processId)
-        if ($listeningPorts.Count -eq 0) {
-            throw "Gateway daemon process $processId has no loopback listener; refusing to terminate it."
-        }
-        foreach ($listeningPort in $listeningPorts) {
-            [void]$portsToRelease.Add($listeningPort)
-        }
-        $orderedPorts = @(
-            if ($Port -ne 0 -and $listeningPorts -contains $Port) {
-                $Port
-            }
-            $listeningPorts |
-                Where-Object { $_ -ne $Port } |
-                Sort-Object -Unique
-        )
+    if (-not $gatewayDetected) {
+        throw (Get-ManualExitMessage `
+            -Reason "The listener on 127.0.0.1:$Port is not an exact installed gateway process.")
+    }
+    try {
+        $gatewayDetected = Test-InstalledGatewayProcess -Entrypoints $entrypoints
+    }
+    catch {
+        throw (Get-ManualExitMessage `
+            -Reason "The upgrade guard could not revalidate the installed gateway process.")
+    }
+    if (
+        -not $gatewayDetected -or
+        -not (Test-AuthenticatedGatewayIdentity `
+            -Port $Port `
+            -BearerToken $bearerToken)
+    ) {
+        throw (Get-ManualExitMessage `
+            -Reason "The listener on 127.0.0.1:$Port did not prove authenticated v2 gateway identity.")
+    }
 
-        $current = Get-RevalidatedGatewayProcess `
-            -Candidate $gatewayProcess `
-            -Entrypoints $entrypoints
-        if ($null -eq $current) {
-            continue
-        }
-        $shutdownResult = Invoke-AuthenticatedGatewayShutdown `
-            -Ports $orderedPorts `
-            -BearerToken $bearerToken
-        if ($shutdownResult -eq "Accepted") {
-            Wait-ForExactProcessExit `
-                -Candidate $gatewayProcess `
-                -TimeoutSeconds $TimeoutSeconds
-            continue
-        }
-        if ($shutdownResult -ne "Unsupported") {
-            throw "Unexpected gateway shutdown result '$shutdownResult'."
-        }
-
-        $current = Get-RevalidatedGatewayProcess `
-            -Candidate $gatewayProcess `
-            -Entrypoints $entrypoints
-        if ($null -eq $current) {
-            continue
-        }
-        Stop-Process -Id $processId -Force -ErrorAction Stop
-        Wait-ForExactProcessExit `
-            -Candidate $gatewayProcess `
-            -TimeoutSeconds $TimeoutSeconds
-        Start-Sleep -Seconds $FallbackLeaseWaitSeconds
+    if (-not (Invoke-AuthenticatedGatewayShutdown `
+        -Port $Port `
+        -BearerToken $bearerToken)) {
+        throw (Get-ManualExitMessage `
+            -Reason "The listener on 127.0.0.1:$Port did not accept authenticated v2 shutdown.")
     }
 
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    foreach ($releasedPort in $portsToRelease) {
-        while (-not (Test-LoopbackPortAvailable -Port $releasedPort)) {
-            if ([DateTime]::UtcNow -ge $deadline) {
-                throw "Gateway loopback port 127.0.0.1:$releasedPort was not released."
-            }
-            Start-Sleep -Milliseconds 100
+    while ($true) {
+        try {
+            $gatewayDetected = Test-InstalledGatewayProcess -Entrypoints $entrypoints
         }
+        catch {
+            throw (Get-ManualExitMessage `
+                -Reason "The upgrade guard could not confirm gateway process exit.")
+        }
+        if (
+            (Test-LoopbackPortAvailable -Port $Port) -and
+            -not $gatewayDetected
+        ) {
+            return
+        }
+        if ([DateTime]::UtcNow -ge $deadline) {
+            throw (Get-ManualExitMessage `
+                -Reason "Authenticated v2 shutdown did not release the gateway process and loopback port.")
+        }
+        Start-Sleep -Milliseconds 100
     }
 }
 

@@ -116,5 +116,6 @@ begin
     Result := 'Unable to run the daemon upgrade guard.'
   else if ResultCode <> 0 then
     Result :=
-      'The existing gateway daemon did not stop or release its loopback port.';
+      'The existing gateway could not be stopped with authenticated v2 shutdown. ' +
+      'Exit the old Copilot IM Gateway and retry.';
 end;

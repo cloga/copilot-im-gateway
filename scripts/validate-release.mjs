@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync, inflateRawSync } from "node:zlib";
 import {
+  daemonRuntimeEntrypoint,
   daemonRuntimeManifest,
   validateEsmClosureManifest,
 } from "./release/esm-closure.mjs";
@@ -196,6 +197,8 @@ export async function validateReleaseArchive(archivePath, checksumPath) {
   }
   await validateEsmClosureManifest({
     manifest,
+    expectedEntrypoint: daemonRuntimeEntrypoint,
+    packageRoot: path.resolve(path.dirname(archivePath), "package"),
     readModule: async (modulePath) => {
       const entryPath = `package/${modulePath}`;
       const contents = archiveEntries.get(entryPath);

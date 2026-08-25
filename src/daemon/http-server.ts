@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 import {
   createServer,
   type IncomingMessage,
@@ -29,6 +29,8 @@ import {
 } from "./schemas.js";
 
 const maxBodyBytes = 1024 * 1024;
+const shutdownChallengePattern = /^[0-9a-f]{64}$/u;
+const shutdownProofPattern = /^[0-9a-f]{64}$/u;
 export const gatewayApiVersion = 2;
 export const gatewayCapabilities = [
   "account-scoped-routing",
@@ -55,6 +57,16 @@ export interface RunningGatewayServer {
 
 export interface ReservedGatewayHttpServer extends RunningGatewayServer {
   activate(options: GatewayHttpHandlerOptions): RunningGatewayServer;
+}
+
+function shutdownProof(
+  bearerToken: string,
+  purpose: "request" | "response",
+  challenge: string,
+): string {
+  return createHmac("sha256", bearerToken)
+    .update(`${purpose}\0${challenge}`, "utf8")
+    .digest("hex");
 }
 
 function isLoopbackOrigin(origin: string): boolean {
@@ -327,6 +339,33 @@ async function handleRequest(
 
     if (method === "GET" && pathname === "/healthz") {
       sendJson(response, 200, { status: "ready" });
+      return;
+    }
+
+    if (method === "GET" && pathname === "/v2/admin/identity") {
+      const challenge = request.headers["x-gateway-shutdown-challenge"];
+      const proof = request.headers["x-gateway-shutdown-proof"];
+      if (
+        typeof challenge !== "string" ||
+        typeof proof !== "string" ||
+        !shutdownChallengePattern.test(challenge) ||
+        !shutdownProofPattern.test(proof) ||
+        !constantTimeTokenEqual(
+          proof,
+          shutdownProof(options.bearerToken, "request", challenge),
+        )
+      ) {
+        throw new GatewayError({
+          code: gatewayErrorCodes.authenticationRequired,
+          message: "Gateway shutdown identity proof is invalid.",
+          status: 401,
+        });
+      }
+      sendJson(response, 200, {
+        apiVersion: gatewayApiVersion,
+        capabilities: gatewayCapabilities,
+        proof: shutdownProof(options.bearerToken, "response", challenge),
+      });
       return;
     }
 

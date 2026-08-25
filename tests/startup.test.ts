@@ -1,3 +1,4 @@
+import { createHmac } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { DatabaseSync } from "node:sqlite";
 import {
@@ -423,6 +424,27 @@ describe("gateway startup", () => {
         await runtime.close();
         shutdownComplete();
       },
+    });
+
+    const challenge = "a".repeat(64);
+    const requestProof = createHmac("sha256", token)
+      .update(`request\0${challenge}`, "utf8")
+      .digest("hex");
+    const identityResponse = await fetch(
+      `${runtime.running.url}/v2/admin/identity`,
+      {
+        headers: {
+          "X-Gateway-Shutdown-Challenge": challenge,
+          "X-Gateway-Shutdown-Proof": requestProof,
+        },
+      },
+    );
+    expect(identityResponse.status).toBe(200);
+    await expect(identityResponse.json()).resolves.toMatchObject({
+      apiVersion: 2,
+      proof: createHmac("sha256", token)
+        .update(`response\0${challenge}`, "utf8")
+        .digest("hex"),
     });
 
     const response = await fetch(`${runtime.running.url}/v2/admin/shutdown`, {
