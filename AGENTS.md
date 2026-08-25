@@ -80,22 +80,35 @@ lines. Coverage includes all production files and must meet or exceed
 Do not weaken CI, coverage, security tests, release/installer verification, or
 the canonical verification closure.
 
-`Governance / Protected policy` runs from `pull_request_target`, checks out and
-executes only protected BASE code and BASE-pinned dependencies, and treats the
-PR head only as git data. Same-repository `cloga/*` branches are bound to the `cloga` PR author and
-authoring-event actor; Dependabot branches require the real `dependabot[bot]`
-PR author and opened/synchronize actor. Label events are instead bound to the
-independently authorized maintainer actor. Forks cannot satisfy branch policy.
-Changes to workflows, CODEOWNERS, policy/checkers, quality closure, coverage,
-security tests, release scripts, or installer verification require a fresh
-`manual-governance` label event from a non-author maintainer. Synchronizing the
-PR invalidates the successful approval run, so the label must be removed and
-freshly reapplied. Coverage baseline decreases and test deletion remain denied.
+`Required governance / Required policy` is supplied by GitHub's official
+repository Ruleset `workflows` rule. It first validates the event and repository
+identity, then checks out exactly `github.workflow_sha`, installs that trusted
+commit's dependencies, and treats the pull-request or merge-group trees only as
+git data. Same-repository `cloga/*` branches require both the `cloga` PR author
+and event actor; Dependabot branches require `dependabot[bot]` for both. Forks
+cannot satisfy branch policy. Protected-path changes remain reported and must
+pass the exact workflow allowlist, pinned-Action, quality-closure, coverage,
+test-retention, content, and architecture checks. Governance, packaging, release, and installer executables and their lint, test,
+coverage, and compiler configurations must remain byte-identical to the
+`github.workflow_sha` tree. Protected npm lifecycle hooks are forbidden.
+Dependency declarations and the transitive npm lock are also pinned, except for
+the application version fields. Changing that executable control plane or
+dependency graph requires an audited administrator update of the immutable
+Ruleset pin.
 
-This first governance PR is trust-on-first-use because remote `main` cannot run
-a workflow it does not yet contain. It requires independent review before
-merge. After merge, configure the repository ruleset to require both Verify and
-Governance checks; agents must not push, merge, release, or change that ruleset.
+The Ruleset must require
+`.github/workflows/governance-required.yml` from
+`cloga/copilot-im-gateway` (repository ID `1343812506`) at the exact immutable
+`<merge-commit-sha>` produced when this bootstrap is merged on `main`.
+`github.workflow_sha` is the checkout and execution trust pin. The repository
+owner performs this one administrative bootstrap merge because the old
+BASE-only label gate cannot admit its own removal, then immediately removes the
+old `Protected policy` branch-status requirement and activates the `workflows`
+rule at that merge SHA. This is not a reusable bypass. Every SHA or rule update
+is an audited administrator action. Agents must not push, merge, release, or
+alter live rulesets; status contexts are auxiliary only. See
+`docs/security.md`.
+
 Also configure a protected `v*` tag ruleset or release environment. The Release
 workflow independently rejects tag commits that are not reachable from
 `origin/main`.

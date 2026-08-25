@@ -19,7 +19,7 @@ extension/Canvas, release/installer, CI/governance, and dependency effects. -->
 - [ ] No generated archives, installers, checksums, coverage, or build output added
 - [ ] Release/installer reproducibility remains covered when packaging changes
 - [ ] Extension reloaded/inspected when extension code changed
-- [ ] Protected changes have a fresh `manual-governance` label from a non-author maintainer
+- [ ] CI/governance changes preserve the `github.workflow_sha` trust pin, exact required-workflow AST, and Ruleset contract
 
 ## Tracking issue
 

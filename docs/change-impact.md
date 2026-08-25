@@ -10,7 +10,7 @@ evidence.
 | `src/channels/**` | Protocol compatibility, fixture transport regression, no live iLink in default tests |
 | `.github/extensions/im-gateway/**` | Official SDK `joinSession()` lifecycle, permission mediation, Canvas/daemon mock and manual reload |
 | Release or installer | Deterministic archives, checksums, consumer validation, Windows installer build/smoke |
-| CI or governance | Permission review, immutable Action SHAs, BASE-only `pull_request_target`, fresh maintainer approval |
+| CI or governance | Permission review, immutable Action SHAs, exact workflow semantics, `github.workflow_sha` execution pin, required-workflow Ruleset trust tuple and merge-queue behavior |
 | Dependencies | Lockfile, audit result, runtime/development scope, Dependabot impact |
 
 Do not propose generic agent commands, ACP backends, public listeners,

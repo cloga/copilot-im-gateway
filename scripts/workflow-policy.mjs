@@ -14,117 +14,175 @@ const setupNodeAction =
   "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020";
 const uploadArtifactAction =
   "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02";
-const protectedBaseValidationScript =
-  'test "$BASE_REF" = "main" && test "$BASE_REPO_FULL_NAME" = "cloga/copilot-im-gateway" && test "$REPOSITORY" = "cloga/copilot-im-gateway"';
-
-const governanceApprovalScript = `approved=false
-if [[ "$ACTION" == "labeled" && "$LABEL" == "manual-governance" && "$EVENT_ACTOR" != "$PR_AUTHOR" ]]; then
-  permission="$(gh api "repos/$REPOSITORY/collaborators/$EVENT_ACTOR/permission" --jq .permission)"
-  if [[ "$permission" == "admin" || "$permission" == "maintain" || "$permission" == "write" ]]; then
-    approved=true
-  fi
-fi
-echo "approved=$approved" >> "$GITHUB_OUTPUT"
+const trustedEventValidationScript = `set -euo pipefail
+sha_pattern='^[0-9a-f]{40}$'
+test "$REPOSITORY" = "cloga/copilot-im-gateway"
+test "$REPOSITORY_ID" = "1343812506"
+[[ "$WORKFLOW_SHA" =~ $sha_pattern ]]
+case "$EVENT_NAME" in
+  pull_request)
+    case "$EVENT_ACTION" in
+      opened|synchronize|reopened|ready_for_review|edited) ;;
+      *) exit 1 ;;
+    esac
+    test "$PR_BASE_REF" = "main"
+    test "$PR_BASE_REPO_FULL_NAME" = "$REPOSITORY"
+    test "$PR_BASE_REPO_ID" = "$REPOSITORY_ID"
+    test "$PR_HEAD_REPO_FULL_NAME" = "$REPOSITORY"
+    test "$PR_HEAD_REPO_ID" = "$REPOSITORY_ID"
+    test "$PR_HEAD_REPO_OWNER" = "cloga"
+    [[ "$PR_BASE_SHA" =~ $sha_pattern ]]
+    [[ "$PR_HEAD_SHA" =~ $sha_pattern ]]
+    [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+    if [[ "$PR_HEAD_REF" == cloga/* && "$PR_HEAD_REF" != "cloga/" ]]; then
+      expected_actor="cloga"
+    elif [[ "$PR_HEAD_REF" == dependabot/* && "$PR_HEAD_REF" != "dependabot/" ]]; then
+      expected_actor="dependabot[bot]"
+    else
+      exit 1
+    fi
+    test "$PR_AUTHOR" = "$expected_actor"
+    test "$ACTOR" = "$expected_actor"
+    ;;
+  merge_group)
+    test "$EVENT_ACTION" = "checks_requested"
+    test "$MERGE_BASE_REF" = "refs/heads/main"
+    [[ "$MERGE_BASE_SHA" =~ $sha_pattern ]]
+    [[ "$MERGE_HEAD_SHA" =~ $sha_pattern ]]
+    ;;
+  *) exit 1 ;;
+esac
 `;
-
-const governancePrepareProvenanceScript = `expected_actor=""
-if [[ "$HEAD_REPO_FULL_NAME" == "$REPOSITORY" && "$HEAD_REPO_OWNER" == "cloga" ]]; then
-  if [[ "$HEAD_REF" == cloga/* && "$PR_AUTHOR" == "cloga" ]]; then
-    expected_actor="cloga"
-  elif [[ "$HEAD_REF" == dependabot/* && "$PR_AUTHOR" == "dependabot[bot]" ]]; then
-    expected_actor="dependabot[bot]"
-  fi
-fi
-if [[ -z "$expected_actor" || "$EVENT_ACTOR" != "$expected_actor" ]]; then
+const fetchGitDataScript = `set -euo pipefail
+sha_pattern='^[0-9a-f]{40}$'
+if [[ "$EVENT_NAME" = "pull_request" ]]; then
+  [[ "$PR_BASE_SHA" =~ $sha_pattern ]]
+  [[ "$PR_HEAD_SHA" =~ $sha_pattern ]]
+  [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
+  base_sha="$PR_BASE_SHA"
+  head_sha="$PR_HEAD_SHA"
+  git fetch --no-tags --depth=1 origin "$base_sha"
+  git fetch --no-tags --depth=1 origin "refs/pull/$PR_NUMBER/head"
+elif [[ "$EVENT_NAME" = "merge_group" ]]; then
+  [[ "$MERGE_BASE_SHA" =~ $sha_pattern ]]
+  [[ "$MERGE_HEAD_SHA" =~ $sha_pattern ]]
+  base_sha="$MERGE_BASE_SHA"
+  head_sha="$MERGE_HEAD_SHA"
+  git fetch --no-tags --depth=1 origin "$base_sha"
+  git fetch --no-tags --depth=1 origin "$head_sha"
+else
   exit 1
 fi
-mkdir provenance
-printf '%s\\n' "$HEAD_SHA:$expected_actor:$PR_NUMBER" > provenance/head.txt
+test "$(git rev-parse FETCH_HEAD)" = "$head_sha"
+git cat-file -e "$base_sha^{commit}"
+git cat-file -e "$head_sha^{commit}"
 `;
-
-const governanceProvenanceScript = `verified=false
-expected_actor=""
-if [[ "$HEAD_REPO_FULL_NAME" == "$REPOSITORY" && "$HEAD_REPO_OWNER" == "cloga" ]]; then
-  if [[ "$HEAD_REF" == cloga/* && "$PR_AUTHOR" == "cloga" ]]; then
-    expected_actor="cloga"
-  elif [[ "$HEAD_REF" == dependabot/* && "$PR_AUTHOR" == "dependabot[bot]" ]]; then
-    expected_actor="dependabot[bot]"
-  fi
+const evaluateRequiredPolicyScript = `set -euo pipefail
+if [[ "$EVENT_NAME" = "pull_request" ]]; then
+  node scripts/governance-check.mjs \\
+    --workflow-sha "$WORKFLOW_SHA" \\
+    --event-name "$EVENT_NAME" \\
+    --event-action "$EVENT_ACTION" \\
+    --repository "$REPOSITORY" \\
+    --repository-id "$REPOSITORY_ID" \\
+    --base "$PR_BASE_SHA" \\
+    --base-ref "$PR_BASE_REF" \\
+    --base-repo-full-name "$PR_BASE_REPO_FULL_NAME" \\
+    --base-repo-id "$PR_BASE_REPO_ID" \\
+    --head "$PR_HEAD_SHA" \\
+    --head-ref "$PR_HEAD_REF" \\
+    --head-repo-owner "$PR_HEAD_REPO_OWNER" \\
+    --head-repo-full-name "$PR_HEAD_REPO_FULL_NAME" \\
+    --head-repo-id "$PR_HEAD_REPO_ID" \\
+    --pr-author "$PR_AUTHOR" \\
+    --actor "$ACTOR"
+elif [[ "$EVENT_NAME" = "merge_group" ]]; then
+  node scripts/governance-check.mjs \\
+    --workflow-sha "$WORKFLOW_SHA" \\
+    --event-name "$EVENT_NAME" \\
+    --event-action "$EVENT_ACTION" \\
+    --repository "$REPOSITORY" \\
+    --repository-id "$REPOSITORY_ID" \\
+    --base "$MERGE_BASE_SHA" \\
+    --base-ref "$MERGE_BASE_REF" \\
+    --base-repo-full-name "$REPOSITORY" \\
+    --base-repo-id "$REPOSITORY_ID" \\
+    --head "$MERGE_HEAD_SHA" \\
+    --head-ref "$MERGE_HEAD_REF" \\
+    --head-repo-owner "$REPOSITORY_OWNER" \\
+    --head-repo-full-name "$REPOSITORY" \\
+    --head-repo-id "$REPOSITORY_ID" \\
+    --actor "$ACTOR"
+else
+  exit 1
 fi
-export EXPECTED_ACTOR="$expected_actor"
-if [[ -n "$expected_actor" ]]; then
-  if [[ "$EVENT_ACTION" == "opened" || "$EVENT_ACTION" == "synchronize" ]]; then
-    if [[ "$EVENT_ACTOR" == "$expected_actor" ]]; then
-      verified=true
-    fi
-  else
-    mapfile -t candidates < <(gh api "repos/$REPOSITORY/actions/artifacts?name=governance-head-$HEAD_SHA&per_page=100" --jq '.artifacts[] | select(.expired == false) | "\\(.id) \\(.workflow_run.id)"')
-    for candidate in "\${candidates[@]}"; do
-      read -r artifact_id run_id <<< "$candidate"
-      if [[ ! "$artifact_id" =~ ^[0-9]+$ || ! "$run_id" =~ ^[0-9]+$ ]]; then
-        continue
-      fi
-      if ! gh api "repos/$REPOSITORY/actions/runs/$run_id" | node -e 'const fs=require("node:fs");const run=JSON.parse(fs.readFileSync(0,"utf8"));const valid=run.name==="Governance"&&run.path===".github/workflows/governance.yml"&&run.event==="pull_request_target"&&run.actor?.login===process.env.EXPECTED_ACTOR&&run.repository?.full_name===process.env.REPOSITORY;process.exit(valid?0:1)'; then
-        continue
-      fi
-      artifact_zip="$RUNNER_TEMP/governance-provenance-$artifact_id.zip"
-      gh api "repos/$REPOSITORY/actions/artifacts/$artifact_id/zip" > "$artifact_zip"
-      if [[ "$(unzip -Z1 "$artifact_zip")" == "head.txt" && "$(unzip -p "$artifact_zip" head.txt)" == "$HEAD_SHA:$expected_actor:$PR_NUMBER" ]]; then
-        verified=true
-        break
-      fi
-    done
-  fi
-fi
-echo "verified=$verified" >> "$GITHUB_OUTPUT"
 `;
 
 const governanceExpected = {
-  name: "Governance",
+  name: "Required governance",
   on: {
-    pull_request_target: {
+    pull_request: {
       types: [
         "opened",
         "synchronize",
-        "edited",
         "reopened",
         "ready_for_review",
-        "labeled",
-        "unlabeled",
+        "edited",
       ],
+    },
+    merge_group: {
+      types: ["checks_requested"],
     },
   },
   permissions: {
-    actions: "read",
     contents: "read",
   },
   jobs: {
-    "protected-policy": {
-      name: "Protected policy",
+    "required-policy": {
+      name: "Required policy",
       "runs-on": "ubuntu-latest",
       steps: [
         {
-          name: "Validate protected base target",
+          name: "Validate trusted event context",
           env: {
-            BASE_REF: "${{ github.event.pull_request.base.ref }}",
-            BASE_REPO_FULL_NAME:
+            ACTOR: "${{ github.actor }}",
+            EVENT_ACTION: "${{ github.event.action }}",
+            EVENT_NAME: "${{ github.event_name }}",
+            MERGE_BASE_REF: "${{ github.event.merge_group.base_ref }}",
+            MERGE_BASE_SHA: "${{ github.event.merge_group.base_sha }}",
+            MERGE_HEAD_SHA: "${{ github.event.merge_group.head_sha }}",
+            PR_AUTHOR: "${{ github.event.pull_request.user.login }}",
+            PR_BASE_REF: "${{ github.event.pull_request.base.ref }}",
+            PR_BASE_REPO_FULL_NAME:
               "${{ github.event.pull_request.base.repo.full_name }}",
+            PR_BASE_REPO_ID: "${{ github.event.pull_request.base.repo.id }}",
+            PR_BASE_SHA: "${{ github.event.pull_request.base.sha }}",
+            PR_HEAD_REF: "${{ github.event.pull_request.head.ref }}",
+            PR_HEAD_REPO_FULL_NAME:
+              "${{ github.event.pull_request.head.repo.full_name }}",
+            PR_HEAD_REPO_ID: "${{ github.event.pull_request.head.repo.id }}",
+            PR_HEAD_REPO_OWNER:
+              "${{ github.event.pull_request.head.repo.owner.login }}",
+            PR_HEAD_SHA: "${{ github.event.pull_request.head.sha }}",
+            PR_NUMBER: "${{ github.event.pull_request.number }}",
             REPOSITORY: "${{ github.repository }}",
+            REPOSITORY_ID: "${{ github.repository_id }}",
+            WORKFLOW_SHA: "${{ github.workflow_sha }}",
           },
           shell: "bash",
-          run: protectedBaseValidationScript,
+          run: trustedEventValidationScript,
         },
         {
-          name: "Check out protected base",
+          name: "Check out required workflow source",
           uses: checkoutAction,
           with: {
-            ref: "${{ github.event.pull_request.base.sha }}",
+            ref: "${{ github.workflow_sha }}",
             "fetch-depth": 1,
             "persist-credentials": false,
           },
         },
         {
-          name: "Set up protected base Node",
+          name: "Set up trusted Node",
           uses: setupNodeAction,
           with: {
             "node-version": "24.11.1",
@@ -132,101 +190,52 @@ const governanceExpected = {
           },
         },
         {
-          name: "Install protected base dependencies",
+          name: "Install trusted dependencies",
           run: "npm ci --ignore-scripts --no-audit --no-fund",
         },
         {
-          name: "Fetch untrusted head as git data only",
+          name: "Fetch target and untrusted head as git data only",
           env: {
+            EVENT_NAME: "${{ github.event_name }}",
+            MERGE_BASE_SHA: "${{ github.event.merge_group.base_sha }}",
+            MERGE_HEAD_SHA: "${{ github.event.merge_group.head_sha }}",
+            PR_BASE_SHA: "${{ github.event.pull_request.base.sha }}",
+            PR_HEAD_SHA: "${{ github.event.pull_request.head.sha }}",
             PR_NUMBER: "${{ github.event.pull_request.number }}",
-          },
-          run: 'git fetch --no-tags --depth=1 origin "refs/pull/${PR_NUMBER}/head"',
-        },
-        {
-          name: "Prepare exact head provenance",
-          if: "github.event.action == 'opened' || github.event.action == 'synchronize'",
-          env: {
-            EVENT_ACTOR: "${{ github.actor }}",
-            HEAD_REF: "${{ github.event.pull_request.head.ref }}",
-            HEAD_REPO_FULL_NAME:
-              "${{ github.event.pull_request.head.repo.full_name }}",
-            HEAD_REPO_OWNER:
-              "${{ github.event.pull_request.head.repo.owner.login }}",
-            HEAD_SHA: "${{ github.event.pull_request.head.sha }}",
-            PR_AUTHOR: "${{ github.event.pull_request.user.login }}",
-            PR_NUMBER: "${{ github.event.pull_request.number }}",
-            REPOSITORY: "${{ github.repository }}",
           },
           shell: "bash",
-          run: governancePrepareProvenanceScript,
+          run: fetchGitDataScript,
         },
         {
-          name: "Upload exact head provenance",
-          if: "github.event.action == 'opened' || github.event.action == 'synchronize'",
-          uses: uploadArtifactAction,
-          with: {
-            name: "governance-head-${{ github.event.pull_request.head.sha }}",
-            path: "provenance/head.txt",
-            "if-no-files-found": "error",
-            "retention-days": 90,
-          },
-        },
-        {
-          name: "Validate exact head provenance",
-          id: "provenance",
+          name: "Evaluate required policy",
           env: {
-            GH_TOKEN: "${{ github.token }}",
+            ACTOR: "${{ github.actor }}",
             EVENT_ACTION: "${{ github.event.action }}",
-            EVENT_ACTOR: "${{ github.actor }}",
-            HEAD_REF: "${{ github.event.pull_request.head.ref }}",
-            HEAD_REPO_FULL_NAME:
-              "${{ github.event.pull_request.head.repo.full_name }}",
-            HEAD_REPO_OWNER:
-              "${{ github.event.pull_request.head.repo.owner.login }}",
-            HEAD_SHA: "${{ github.event.pull_request.head.sha }}",
+            EVENT_NAME: "${{ github.event_name }}",
+            MERGE_BASE_REF: "${{ github.event.merge_group.base_ref }}",
+            MERGE_BASE_SHA: "${{ github.event.merge_group.base_sha }}",
+            MERGE_HEAD_REF: "${{ github.event.merge_group.head_ref }}",
+            MERGE_HEAD_SHA: "${{ github.event.merge_group.head_sha }}",
             PR_AUTHOR: "${{ github.event.pull_request.user.login }}",
-            PR_NUMBER: "${{ github.event.pull_request.number }}",
-            REPOSITORY: "${{ github.repository }}",
-          },
-          shell: "bash",
-          run: governanceProvenanceScript,
-        },
-        {
-          name: "Validate fresh maintainer approval",
-          id: "approval",
-          env: {
-            ACTION: "${{ github.event.action }}",
-            EVENT_ACTOR: "${{ github.actor }}",
-            GH_TOKEN: "${{ github.token }}",
-            LABEL: "${{ github.event.label.name }}",
-            PR_AUTHOR: "${{ github.event.pull_request.user.login }}",
-            REPOSITORY: "${{ github.repository }}",
-          },
-          shell: "bash",
-          run: governanceApprovalScript,
-        },
-        {
-          name: "Evaluate protected base policy",
-          env: {
-            BASE_REF: "${{ github.event.pull_request.base.ref }}",
-            BASE_REPO_FULL_NAME:
+            PR_BASE_REF: "${{ github.event.pull_request.base.ref }}",
+            PR_BASE_REPO_FULL_NAME:
               "${{ github.event.pull_request.base.repo.full_name }}",
-            BASE_SHA: "${{ github.event.pull_request.base.sha }}",
-            EVENT_ACTION: "${{ github.event.action }}",
-            EVENT_ACTOR: "${{ github.actor }}",
-            HEAD_REF: "${{ github.event.pull_request.head.ref }}",
-            HEAD_REPO_FULL_NAME:
+            PR_BASE_REPO_ID: "${{ github.event.pull_request.base.repo.id }}",
+            PR_BASE_SHA: "${{ github.event.pull_request.base.sha }}",
+            PR_HEAD_REF: "${{ github.event.pull_request.head.ref }}",
+            PR_HEAD_REPO_FULL_NAME:
               "${{ github.event.pull_request.head.repo.full_name }}",
-            HEAD_REPO_OWNER:
+            PR_HEAD_REPO_ID: "${{ github.event.pull_request.head.repo.id }}",
+            PR_HEAD_REPO_OWNER:
               "${{ github.event.pull_request.head.repo.owner.login }}",
-            HEAD_SHA: "${{ github.event.pull_request.head.sha }}",
-            HEAD_PROVENANCE_VERIFIED:
-              "${{ steps.provenance.outputs.verified }}",
-            MANUAL_GOVERNANCE_APPROVED:
-              "${{ steps.approval.outputs.approved }}",
-            PR_AUTHOR: "${{ github.event.pull_request.user.login }}",
+            PR_HEAD_SHA: "${{ github.event.pull_request.head.sha }}",
+            REPOSITORY: "${{ github.repository }}",
+            REPOSITORY_ID: "${{ github.repository_id }}",
+            REPOSITORY_OWNER: "${{ github.repository_owner }}",
+            WORKFLOW_SHA: "${{ github.workflow_sha }}",
           },
-          run: 'node scripts/governance-check.mjs --base "$BASE_SHA" --base-ref "$BASE_REF" --base-repo-full-name "$BASE_REPO_FULL_NAME" --head "$HEAD_SHA" --head-ref "$HEAD_REF" --head-repo-owner "$HEAD_REPO_OWNER" --head-repo-full-name "$HEAD_REPO_FULL_NAME" --pr-author "$PR_AUTHOR" --event-action "$EVENT_ACTION" --event-actor "$EVENT_ACTOR" --head-provenance-verified "$HEAD_PROVENANCE_VERIFIED" --manual-governance-approved "$MANUAL_GOVERNANCE_APPROVED"',
+          shell: "bash",
+          run: evaluateRequiredPolicyScript,
         },
       ],
     },
@@ -431,7 +440,7 @@ release/*.sha256
 const expectedWorkflows = new Map();
 expectedWorkflows.set(".github/workflows/ci.yml", ciExpected);
 expectedWorkflows.set(
-  ".github/workflows/governance.yml",
+  ".github/workflows/governance-required.yml",
   governanceExpected,
 );
 expectedWorkflows.set(".github/workflows/release.yml", releaseExpected);
