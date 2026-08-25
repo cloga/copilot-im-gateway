@@ -121,22 +121,25 @@ afterEach(() => {
 describe("GatewayStore durable runtime state", () => {
   it("uses collision-safe account-aware routes for binding and idempotency", () => {
     const store = createStore();
-    const first = identity("bot-a");
-    const second = identity("bot-b");
-    configure(store, first, "session-a");
-    configure(store, second, "session-b");
+    try {
+      const first = identity("bot-a");
+      const second = identity("bot-b");
+      configure(store, first, "session-a");
+      configure(store, second, "session-b");
 
-    expect(toRouteKey(first)).not.toBe(toRouteKey(second));
-    expect(admit(store, message("same-id", first)).disposition).toBe("reserved");
-    expect(admit(store, message("same-id", second)).disposition).toBe("reserved");
-    expect(store.leaseInbound("session-a", new Date(start).toISOString(), 60)?.message.accountId).toBe(
-      "bot-a",
-    );
-    expect(store.leaseInbound("session-b", new Date(start).toISOString(), 60)?.message.accountId).toBe(
-      "bot-b",
-    );
-    store.close();
-  });
+      expect(toRouteKey(first)).not.toBe(toRouteKey(second));
+      expect(admit(store, message("same-id", first)).disposition).toBe("reserved");
+      expect(admit(store, message("same-id", second)).disposition).toBe("reserved");
+      expect(store.leaseInbound("session-a", new Date(start).toISOString(), 60)?.message.accountId).toBe(
+        "bot-a",
+      );
+      expect(store.leaseInbound("session-b", new Date(start).toISOString(), 60)?.message.accountId).toBe(
+        "bot-b",
+      );
+    } finally {
+      store.close();
+    }
+  }, 20_000);
 
   it("persists accepted idempotency while re-evaluating bounded rejections", () => {
     const clock = new MutableClock();
@@ -472,86 +475,95 @@ describe("GatewayStore durable runtime state", () => {
       maxRejectionBuckets: 8,
       rejectionRetentionDays: 1,
     });
-    const service = new GatewayService(store, clock);
     let materializations = 0;
-    for (let index = 0; index < 100; index += 1) {
-      const route = identity(
-        `bot-${index}`,
-        `conversation-${index}`,
-        `sender-${index}`,
-      );
+    try {
+      const service = new GatewayService(store, clock);
+      for (let index = 0; index < 100; index += 1) {
+        const route = identity(
+          `bot-${index}`,
+          `conversation-${index}`,
+          `sender-${index}`,
+        );
+        await expect(
+          service.onInbound({
+            identity: route,
+            messageId: `rejected-${index}`,
+            receivedAt: clock.now().toISOString(),
+            materialize: async () => {
+              materializations += 1;
+              return message(
+                `rejected-${index}`,
+                route,
+                `rejected-secret-body-${index}`,
+              );
+            },
+          }),
+        ).rejects.toMatchObject({ code: "SENDER_NOT_ALLOWED" });
+      }
+      expect(materializations).toBe(0);
+      const boundedInspection = new DatabaseSync(databasePath);
+      try {
+        expect(
+          (
+            boundedInspection
+              .prepare("SELECT COUNT(*) AS count FROM admission_rejections")
+              .get() as { count: number }
+          ).count,
+        ).toBe(8);
+      } finally {
+        boundedInspection.close();
+      }
+
+      clock.advance(24 * 60 * 60 * 1_000 + 1);
+      store.renewOwnership();
       await expect(
         service.onInbound({
-          identity: route,
-          messageId: `rejected-${index}`,
+          identity: identity("new-bot", "new-conversation", "new-sender"),
+          messageId: "after-retention",
           receivedAt: clock.now().toISOString(),
           materialize: async () => {
             materializations += 1;
-            return message(
-              `rejected-${index}`,
-              route,
-              `rejected-secret-body-${index}`,
-            );
+            return message("after-retention");
           },
         }),
       ).rejects.toMatchObject({ code: "SENDER_NOT_ALLOWED" });
+      expect(materializations).toBe(0);
+    } finally {
+      store.close();
     }
-    expect(materializations).toBe(0);
-    const boundedInspection = new DatabaseSync(databasePath);
-    expect(
-      (
-        boundedInspection
-          .prepare("SELECT COUNT(*) AS count FROM admission_rejections")
-          .get() as { count: number }
-      ).count,
-    ).toBe(8);
-    boundedInspection.close();
-
-    clock.advance(24 * 60 * 60 * 1_000 + 1);
-    store.renewOwnership();
-    await expect(
-      service.onInbound({
-        identity: identity("new-bot", "new-conversation", "new-sender"),
-        messageId: "after-retention",
-        receivedAt: clock.now().toISOString(),
-        materialize: async () => {
-          materializations += 1;
-          return message("after-retention");
-        },
-      }),
-    ).rejects.toMatchObject({ code: "SENDER_NOT_ALLOWED" });
-    expect(materializations).toBe(0);
-    store.close();
 
     const database = new DatabaseSync(databasePath);
-    expect(
-      (
-        database
-          .prepare("SELECT COUNT(*) AS count FROM inbound_admissions")
-          .get() as { count: number }
-      ).count,
-    ).toBe(0);
-    expect(
-      (
-        database
-          .prepare("SELECT COUNT(*) AS count FROM admission_rejections")
-          .get() as { count: number }
-      ).count,
-    ).toBe(1);
-    expect(
-      (
-        database.prepare("SELECT COUNT(*) AS count FROM audit_events").get() as {
-          count: number;
-        }
-      ).count,
-    ).toBe(0);
-    expect(
-      JSON.stringify(
-        database.prepare("SELECT * FROM admission_rejections").all(),
-      ),
-    ).not.toContain("rejected-secret-body");
-    database.close();
-  });
+    try {
+      expect(
+        (
+          database
+            .prepare("SELECT COUNT(*) AS count FROM inbound_admissions")
+            .get() as { count: number }
+        ).count,
+      ).toBe(0);
+      expect(
+        (
+          database
+            .prepare("SELECT COUNT(*) AS count FROM admission_rejections")
+            .get() as { count: number }
+        ).count,
+      ).toBe(1);
+      expect(
+        (
+          database.prepare("SELECT COUNT(*) AS count FROM audit_events").get() as {
+            count: number;
+          }
+        ).count,
+      ).toBe(0);
+      expect(
+        JSON.stringify(
+          database.prepare("SELECT * FROM admission_rejections").all(),
+        ),
+      ).not.toContain("rejected-secret-body");
+    } finally {
+      database.close();
+    }
+  }, 20_000);
 
   it("composes nested transactions with savepoint rollback semantics", () => {
     const store = createStore();

@@ -34,14 +34,35 @@ function Wait-ForHealth {
     throw "Installed daemon did not become healthy."
 }
 
+function Assert-InstallerRejectsPort {
+    param([Parameter(Mandatory = $true)][string]$Value)
+
+    $suffix = [Guid]::NewGuid().ToString("N")
+    $rejected = Start-Process -FilePath $resolvedInstallerPath -ArgumentList @(
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/DIR=$(Join-Path $root "invalid-$suffix")",
+        "/EXTENSIONDIR=$(Join-Path $root "invalid-extension-$suffix")",
+        "/GATEWAYPORT=$Value"
+    ) -Wait -PassThru
+    if ($rejected.ExitCode -eq 0) {
+        throw "Silent installer accepted invalid gateway port '$Value'."
+    }
+}
+
 try {
     New-Item -ItemType Directory -Path $root -Force | Out-Null
+    foreach ($invalidPort in @("not-a-number", "-1", "65536")) {
+        Assert-InstallerRejectsPort -Value $invalidPort
+    }
     $install = Start-Process -FilePath $resolvedInstallerPath -ArgumentList @(
         "/VERYSILENT",
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
         "/DIR=$installDirectory",
-        "/EXTENSIONDIR=$extensionDirectory"
+        "/EXTENSIONDIR=$extensionDirectory",
+        "/GATEWAYPORT=0"
     ) -Wait -PassThru
     if ($install.ExitCode -ne 0) {
         throw "Silent installer failed with exit code $($install.ExitCode)."

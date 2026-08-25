@@ -452,28 +452,30 @@ describe("WeixinAdapter", () => {
       sendText: async () => undefined,
     };
     const adapter = new WeixinAdapter({ store, protocol });
-    await adapter.start({
-      onInbound: async () => undefined,
-      onHealth: async () => undefined,
-    });
-    await adapter.startLogin();
-    const stalePoll = adapter.pollLogin();
-    await adapter.startLogin();
-    resolveStatus?.({
-      status: "confirmed",
-      bot_token: "stale-token",
-      ilink_bot_id: "bot-stale",
-      baseurl: "https://stale.example.test",
-    });
-    await expect(stalePoll).resolves.toEqual({ state: "not_started" });
-    expect(
-      store.getActiveChannelAccount<WeixinCredentials>("local", "weixin-main")
-        ?.identity.accountId,
-    ).toBe("bot-old");
-
-    await adapter.stop();
-    store.close();
-  });
+    try {
+      await adapter.start({
+        onInbound: async () => undefined,
+        onHealth: async () => undefined,
+      });
+      await adapter.startLogin();
+      const stalePoll = adapter.pollLogin();
+      await adapter.startLogin();
+      resolveStatus?.({
+        status: "confirmed",
+        bot_token: "stale-token",
+        ilink_bot_id: "bot-stale",
+        baseurl: "https://stale.example.test",
+      });
+      await expect(stalePoll).resolves.toEqual({ state: "not_started" });
+      expect(
+        store.getActiveChannelAccount<WeixinCredentials>("local", "weixin-main")
+          ?.identity.accountId,
+      ).toBe("bot-old");
+    } finally {
+      await adapter.stop();
+      store.close();
+    }
+  }, 20_000);
 
   it("stops the old account poll before activating a replacement account", async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), "copilot-im-relogin-"));

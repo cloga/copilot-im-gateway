@@ -97,8 +97,8 @@ begin
     Arguments := Arguments + ' -TokenFile "' + TokenFile + '"';
   if PortText <> '' then
   begin
-    if (not TryStrToInt(PortText, GatewayPort)) or
-       (GatewayPort < 0) or (GatewayPort > 65535) then
+    GatewayPort := StrToIntDef(PortText, -1);
+    if (GatewayPort < 0) or (GatewayPort > 65535) then
     begin
       Result := 'Gateway port must be an integer from 0 to 65535.';
       exit;

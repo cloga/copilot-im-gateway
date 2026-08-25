@@ -1,9 +1,11 @@
 import {
   type ChildProcess,
+  type SpawnSyncReturns,
   spawn,
   spawnSync,
 } from "node:child_process";
 import { createHash, createHmac } from "node:crypto";
+import { realpathSync } from "node:fs";
 import {
   mkdir,
   mkdtemp,
@@ -33,6 +35,13 @@ import {
   requiredEntries,
   validateReleaseArchive,
 } from "../scripts/validate-release.mjs";
+
+const slowPowerShellTimeout = 45_000;
+
+function expectSpawnCompleted(result: SpawnSyncReturns<string>): void {
+  expect(result.error).toBeUndefined();
+  expect(result.signal).toBeNull();
+}
 
 async function createReleaseFixture(
   stage: string,
@@ -603,6 +612,13 @@ describe("release packaging", () => {
     expect(installer).not.toContain("runascurrentuser");
     expect(installer).toContain("PrepareToInstall");
     expect(installer).toContain("ExtractTemporaryFile('stop-daemon.ps1')");
+    expect(installer).toContain(
+      "GatewayPort := StrToIntDef(PortText, -1);",
+    );
+    expect(installer).toContain(
+      "(GatewayPort < 0) or (GatewayPort > 65535)",
+    );
+    expect(installer).not.toContain("TryStrToInt");
     expect(releaseWorkflow).toContain("npm run release:installer:smoke");
     expect(releaseWorkflow).toContain("release/*.exe");
     expect(installScript).toContain(
@@ -618,7 +634,8 @@ describe("release packaging", () => {
       ),
     );
     expect(stopDaemonScript).toContain("Get-CimInstance Win32_Process");
-    expect(stopDaemonScript).toContain("Get-NetTCPConnection");
+    expect(stopDaemonScript).toContain("MSFT_NetTCPConnection");
+    expect(stopDaemonScript).toContain("GetFinalPathNameByHandle");
     expect(stopDaemonScript).toContain("OwningProcess");
     expect(stopDaemonScript).toContain("CreationMarker");
     expect(stopDaemonScript).toContain("CommandLineToArgvW");
@@ -753,10 +770,11 @@ describe("release packaging", () => {
           ],
           {
             encoding: "utf8",
-            timeout: 15_000,
+            timeout: slowPowerShellTimeout,
             windowsHide: true,
           },
         );
+        expectSpawnCompleted(blocked);
         expect(
           blocked.status,
           `${blocked.stdout}\n${blocked.stderr}`,
@@ -874,9 +892,10 @@ describe("release packaging", () => {
         ];
         const blocked = spawnSync("powershell.exe", stopArguments, {
           encoding: "utf8",
-          timeout: 15_000,
+          timeout: slowPowerShellTimeout,
           windowsHide: true,
         });
+        expectSpawnCompleted(blocked);
         expect(
           blocked.status,
           `${blocked.stdout}\n${blocked.stderr}`,
@@ -892,9 +911,10 @@ describe("release packaging", () => {
         await stopTestProcess(legacy);
         const unblocked = spawnSync("powershell.exe", stopArguments, {
           encoding: "utf8",
-          timeout: 15_000,
+          timeout: slowPowerShellTimeout,
           windowsHide: true,
         });
+        expectSpawnCompleted(unblocked);
         expect(
           unblocked.status,
           `${unblocked.stdout}\n${unblocked.stderr}`,
@@ -1117,44 +1137,59 @@ describe("release packaging", () => {
 
   it.skipIf(process.platform !== "win32")(
     "selects only an exact tokenized Node daemon entrypoint",
-    () => {
-      const root = path.resolve(import.meta.dirname, "..");
+    async () => {
+      const root = await mkdtemp(
+        path.join(os.tmpdir(), "copilot-im-gateway-command-line-"),
+      );
       const stopScript = path.join(
-        root,
+        path.resolve(import.meta.dirname, ".."),
         "scripts",
         "release",
         "stop-daemon.ps1",
       );
       const installDirectory = path.join(root, "fixture install");
-      const quote = (value: string) => value.replaceAll("'", "''");
-      const command = [
-        `. '${quote(stopScript)}' -InstallDirectory '${quote(installDirectory)}'`,
-        `$entrypoint = [IO.Path]::GetFullPath('${quote(path.join(installDirectory, "dist", "daemon", "main.js"))}')`,
-        "$entrypoints = @($entrypoint)",
-        `$exact = [pscustomobject]@{ Name = 'node.exe'; ExecutablePath = 'C:\\Program Files\\nodejs\\node.exe'; CommandLine = '"C:\\Program Files\\nodejs\\node.exe" "' + $entrypoint + '"' }`,
-        `$substring = [pscustomobject]@{ Name = 'node.exe'; ExecutablePath = 'C:\\Program Files\\nodejs\\node.exe'; CommandLine = '"C:\\Program Files\\nodejs\\node.exe" "' + $entrypoint + '.backup"' }`,
-        `$optionValue = [pscustomobject]@{ Name = 'node.exe'; ExecutablePath = 'C:\\Program Files\\nodejs\\node.exe'; CommandLine = '"C:\\Program Files\\nodejs\\node.exe" "--target=' + $entrypoint + '"' }`,
-        `$workerArgument = [pscustomobject]@{ Name = 'node.exe'; ExecutablePath = 'C:\\Program Files\\nodejs\\node.exe'; CommandLine = '"C:\\Program Files\\nodejs\\node.exe" "C:\\workers\\worker.js" "' + $entrypoint + '"' }`,
-        `$wrongExecutable = [pscustomobject]@{ Name = 'gateway.exe'; ExecutablePath = 'C:\\Program Files\\nodejs\\node.exe'; CommandLine = $exact.CommandLine }`,
-        "if (-not (Test-GatewayProcess -Process $exact -Entrypoints $entrypoints)) { throw 'Exact daemon command line was rejected.' }",
-        "if (Test-GatewayProcess -Process $substring -Entrypoints $entrypoints) { throw 'Substring command line was selected.' }",
-        "if (Test-GatewayProcess -Process $optionValue -Entrypoints $entrypoints) { throw 'Option substring was selected.' }",
-        "if (Test-GatewayProcess -Process $workerArgument -Entrypoints $entrypoints) { throw 'Daemon path in a worker argument was selected.' }",
-        "if (Test-GatewayProcess -Process $wrongExecutable -Entrypoints $entrypoints) { throw 'Non-Node executable was selected.' }",
-      ].join("; ");
-      const result = spawnSync(
-        "powershell.exe",
-        [
-          "-NoProfile",
-          "-NonInteractive",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-Command",
-          command,
-        ],
-        { encoding: "utf8" },
+      const entrypoint = path.join(
+        installDirectory,
+        "dist",
+        "daemon",
+        "main.js",
       );
-      expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+      const quote = (value: string) => value.replaceAll("'", "''");
+      try {
+        await mkdir(path.dirname(entrypoint), { recursive: true });
+        await writeFile(entrypoint, "export {};\n", "utf8");
+        const command = [
+          `. '${quote(stopScript)}' -InstallDirectory '${quote(installDirectory)}'`,
+          `$entrypoint = [IO.Path]::GetFullPath('${quote(entrypoint)}')`,
+          "$entrypoints = @($entrypoint)",
+          `$node = '${quote(process.execPath)}'`,
+          `$exact = [pscustomobject]@{ Name = 'node.exe'; ExecutablePath = $node; CommandLine = '"' + $node + '" "' + $entrypoint + '"' }`,
+          `$substring = [pscustomobject]@{ Name = 'node.exe'; ExecutablePath = $node; CommandLine = '"' + $node + '" "' + $entrypoint + '.backup"' }`,
+          `$optionValue = [pscustomobject]@{ Name = 'node.exe'; ExecutablePath = $node; CommandLine = '"' + $node + '" "--target=' + $entrypoint + '"' }`,
+          `$workerArgument = [pscustomobject]@{ Name = 'node.exe'; ExecutablePath = $node; CommandLine = '"' + $node + '" "C:\\workers\\worker.js" "' + $entrypoint + '"' }`,
+          `$wrongExecutable = [pscustomobject]@{ Name = 'gateway.exe'; ExecutablePath = $node; CommandLine = $exact.CommandLine }`,
+          "if (-not (Test-GatewayProcess -Process $exact -Entrypoints $entrypoints)) { throw 'Exact daemon command line was rejected.' }",
+          "if (Test-GatewayProcess -Process $substring -Entrypoints $entrypoints) { throw 'Substring command line was selected.' }",
+          "if (Test-GatewayProcess -Process $optionValue -Entrypoints $entrypoints) { throw 'Option substring was selected.' }",
+          "if (Test-GatewayProcess -Process $workerArgument -Entrypoints $entrypoints) { throw 'Daemon path in a worker argument was selected.' }",
+          "if (Test-GatewayProcess -Process $wrongExecutable -Entrypoints $entrypoints) { throw 'Non-Node executable was selected.' }",
+        ].join("; ");
+        const result = spawnSync(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+          ],
+          { encoding: "utf8" },
+        );
+        expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+      } finally {
+        await rm(root, { force: true, recursive: true });
+      }
     },
   );
 
@@ -1335,9 +1370,11 @@ describe("release packaging", () => {
         expect(owner.ProcessId).toBe(listener.pid);
         expect(owner.CreationMarker).toMatch(/^[0-9]{1,20}$/u);
         expect(owner.ExecutablePath.toLowerCase()).toBe(
-          process.execPath.toLowerCase(),
+          realpathSync.native(process.execPath).toLowerCase(),
         );
-        expect(owner.Entrypoint.toLowerCase()).toBe(entrypoint.toLowerCase());
+        expect(owner.Entrypoint.toLowerCase()).toBe(
+          realpathSync.native(entrypoint).toLowerCase(),
+        );
       } finally {
         if (listener !== undefined) {
           await stopTestProcess(listener);

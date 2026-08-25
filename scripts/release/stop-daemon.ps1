@@ -14,6 +14,8 @@ if ($null -eq ("GatewayCommandLine.Parser" -as [type])) {
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace GatewayCommandLine
 {
@@ -53,6 +55,88 @@ namespace GatewayCommandLine
         }
     }
 }
+
+namespace GatewayFilesystem
+{
+    public static class Identity
+    {
+        private const uint FILE_SHARE_READ = 0x00000001;
+        private const uint FILE_SHARE_WRITE = 0x00000002;
+        private const uint FILE_SHARE_DELETE = 0x00000004;
+        private const uint OPEN_EXISTING = 3;
+        private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFile(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandle(
+            SafeFileHandle file,
+            StringBuilder path,
+            uint pathLength,
+            uint flags);
+
+        public static string GetFinalPath(string path)
+        {
+            using (SafeFileHandle handle = CreateFile(
+                path,
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                IntPtr.Zero,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                IntPtr.Zero))
+            {
+                if (handle.IsInvalid)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+
+                StringBuilder buffer = new StringBuilder(512);
+                uint length = GetFinalPathNameByHandle(
+                    handle,
+                    buffer,
+                    (uint)buffer.Capacity,
+                    0);
+                if (length == 0)
+                {
+                    throw new Win32Exception(Marshal.GetLastWin32Error());
+                }
+                if (length >= buffer.Capacity)
+                {
+                    buffer.Capacity = checked((int)length + 1);
+                    length = GetFinalPathNameByHandle(
+                        handle,
+                        buffer,
+                        (uint)buffer.Capacity,
+                        0);
+                    if (length == 0 || length >= buffer.Capacity)
+                    {
+                        throw new Win32Exception(Marshal.GetLastWin32Error());
+                    }
+                }
+
+                string result = buffer.ToString();
+                if (result.StartsWith(@"\\?\UNC\", StringComparison.Ordinal))
+                {
+                    return @"\\" + result.Substring(8);
+                }
+                if (result.StartsWith(@"\\?\", StringComparison.Ordinal))
+                {
+                    return result.Substring(4);
+                }
+                return result;
+            }
+        }
+    }
+}
 '@
 }
 
@@ -62,15 +146,28 @@ function ConvertFrom-WindowsCommandLine {
     return [GatewayCommandLine.Parser]::Split($CommandLine)
 }
 
+function Resolve-GatewayFinalPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        return [GatewayFilesystem.Identity]::GetFinalPath(
+            [IO.Path]::GetFullPath($Path)
+        )
+    }
+    catch {
+        return $null
+    }
+}
+
 function Test-NodeProcessExecutable {
     param([Parameter(Mandatory = $true)][object]$Process)
 
     $name = [string]$Process.Name
-    $executablePath = [string]$Process.ExecutablePath
+    $executablePath = Resolve-GatewayFinalPath `
+        -Path ([string]$Process.ExecutablePath)
     if (
         [string]::IsNullOrWhiteSpace($name) -or
-        [string]::IsNullOrWhiteSpace($executablePath) -or
-        -not [IO.Path]::IsPathRooted($executablePath)
+        [string]::IsNullOrWhiteSpace($executablePath)
     ) {
         return $false
     }
@@ -102,15 +199,20 @@ function Get-GatewayCommandLineEntrypoint {
     if (-not [IO.Path]::IsPathRooted($scriptArgument)) {
         return $null
     }
-    try {
-        $normalizedScript = [IO.Path]::GetFullPath($scriptArgument)
-    }
-    catch {
+    $normalizedScript = Resolve-GatewayFinalPath -Path $scriptArgument
+    if ([string]::IsNullOrWhiteSpace($normalizedScript)) {
         return $null
     }
     foreach ($entrypoint in $Entrypoints) {
-        if ([StringComparer]::OrdinalIgnoreCase.Equals($normalizedScript, $entrypoint)) {
-            return $entrypoint
+        $normalizedEntrypoint = Resolve-GatewayFinalPath -Path $entrypoint
+        if (
+            -not [string]::IsNullOrWhiteSpace($normalizedEntrypoint) -and
+            [StringComparer]::OrdinalIgnoreCase.Equals(
+                $normalizedScript,
+                $normalizedEntrypoint
+            )
+        ) {
+            return $normalizedEntrypoint
         }
     }
     return $null
@@ -188,6 +290,11 @@ function ConvertTo-GatewayProcessRecord {
     if ($null -eq $entrypoint) {
         return $null
     }
+    $executablePath = Resolve-GatewayFinalPath `
+        -Path ([string]$Process.ExecutablePath)
+    if ([string]::IsNullOrWhiteSpace($executablePath)) {
+        return $null
+    }
     $processId = [long]$Process.ProcessId
     if ($processId -lt 1 -or $processId -gt [uint32]::MaxValue) {
         throw "The listener process ID is invalid."
@@ -195,8 +302,8 @@ function ConvertTo-GatewayProcessRecord {
     return [pscustomobject]@{
         ProcessId = $processId
         CreationMarker = ConvertTo-ProcessCreationMarker -Process $Process
-        ExecutablePath = [IO.Path]::GetFullPath([string]$Process.ExecutablePath)
-        Entrypoint = [IO.Path]::GetFullPath([string]$entrypoint)
+        ExecutablePath = $executablePath
+        Entrypoint = $entrypoint
     }
 }
 
@@ -224,7 +331,11 @@ function Get-InstalledGatewayProcessRecords {
     param([Parameter(Mandatory = $true)][string[]]$Entrypoints)
 
     $records = @()
-    foreach ($process in @(Get-CimInstance Win32_Process -ErrorAction Stop)) {
+    foreach ($process in @(
+        Get-CimInstance Win32_Process `
+            -Filter "Name = 'node.exe' OR Name = 'node'" `
+            -ErrorAction Stop
+    )) {
         if (Test-GatewayProcess -Process $process -Entrypoints $Entrypoints) {
             $records += ConvertTo-GatewayProcessRecord `
                 -Process $process `
@@ -240,24 +351,19 @@ function Get-ValidatedGatewayListenerOwner {
         [Parameter(Mandatory = $true)][string[]]$Entrypoints
     )
 
-    if (
-        $null -eq (
-            Get-Command Get-NetTCPConnection `
-                -ErrorAction SilentlyContinue
-        )
-    ) {
-        throw "Get-NetTCPConnection is unavailable."
-    }
     $listeners = @(
-        Get-NetTCPConnection `
-            -State Listen `
-            -LocalAddress "127.0.0.1" `
-            -LocalPort $Port `
+        Get-CimInstance `
+            -Namespace "root/StandardCimv2" `
+            -ClassName "MSFT_NetTCPConnection" `
+            -Filter (
+                "LocalAddress = '127.0.0.1' AND " +
+                "LocalPort = $Port AND State = 2"
+            ) `
             -ErrorAction Stop |
             Where-Object {
                 [string]$_.LocalAddress -ceq "127.0.0.1" -and
                 [int]$_.LocalPort -eq $Port -and
-                [string]$_.State -ieq "Listen"
+                [int]$_.State -eq 2
             }
     )
     if ($listeners.Count -ne 1) {
