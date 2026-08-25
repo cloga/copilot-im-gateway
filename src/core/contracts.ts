@@ -20,9 +20,36 @@ export interface RouteIdentity extends ChannelAccountIdentity {
   senderId: SenderId;
 }
 
+export function isWellFormedUnicode(value: string): boolean {
+  const intrinsic = (
+    String.prototype as {
+      isWellFormed?: (this: string) => boolean;
+    }
+  ).isWellFormed;
+  if (intrinsic !== undefined) {
+    return intrinsic.call(value);
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const current = value.charCodeAt(index);
+    if (current >= 0xd800 && current <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) {
+        return false;
+      }
+      index += 1;
+    } else if (current >= 0xdc00 && current <= 0xdfff) {
+      return false;
+    }
+  }
+  return true;
+}
+
 export function canonicalizeIdentityComponents(
   components: readonly string[],
 ): string {
+  if (components.some((component) => !isWellFormedUnicode(component))) {
+    throw new TypeError("Identity components must be well-formed Unicode.");
+  }
   return components
     .map((component) => `${Buffer.byteLength(component, "utf8")}:${component}`)
     .join("");

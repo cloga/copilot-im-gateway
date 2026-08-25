@@ -96,6 +96,80 @@ describe("FetchWeixinProtocolClient", () => {
     expect(sendBody.msg.item_list[0]?.type).toBe(1);
   });
 
+  it("rejects ill-formed protocol identity strings", async () => {
+    const client = new FetchWeixinProtocolClient({
+      loginBaseUrl: "https://login.example.test",
+      fetch: vi.fn<typeof fetch>().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            status: "confirmed",
+            bot_token: "bot-token",
+            ilink_bot_id: "\uD800",
+            baseurl: "https://api.example.test",
+          }),
+          { status: 200 },
+        ),
+      ),
+    });
+    await expect(
+      client.pollLoginStatus({
+        baseUrl: "https://login.example.test",
+        qrCode: "qr-id",
+      }),
+    ).rejects.toThrow("well-formed Unicode");
+  });
+
+  it("rejects ill-formed QR and login credential strings", async () => {
+    const qrFetch = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          qrcode: "\uD800",
+          qrcode_img_content: "https://images.example.test/qr",
+        }),
+        { status: 200 },
+      ),
+    );
+    const qrClient = new FetchWeixinProtocolClient({
+      loginBaseUrl: "https://login.example.test",
+      fetch: qrFetch,
+    });
+    await expect(qrClient.getLoginQr([])).rejects.toThrow(
+      "well-formed Unicode",
+    );
+
+    const loginFetch = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          status: "confirmed",
+          bot_token: "\uD800",
+          ilink_bot_id: "bot-id",
+          baseurl: "https://api.example.test",
+        }),
+        { status: 200 },
+      ),
+    );
+    const loginClient = new FetchWeixinProtocolClient({
+      loginBaseUrl: "https://login.example.test",
+      fetch: loginFetch,
+    });
+    await expect(
+      loginClient.pollLoginStatus({
+        baseUrl: "https://login.example.test",
+        qrCode: "qr-id",
+      }),
+    ).rejects.toThrow("well-formed Unicode");
+
+    const localTokenFetch = vi.fn<typeof fetch>();
+    const localTokenClient = new FetchWeixinProtocolClient({
+      loginBaseUrl: "https://login.example.test",
+      fetch: localTokenFetch,
+    });
+    await expect(localTokenClient.getLoginQr(["\uD800"])).rejects.toThrow(
+      "well-formed Unicode",
+    );
+    expect(localTokenFetch).not.toHaveBeenCalled();
+  });
+
   it("pins ONLINE compatibility and retains empty cursor/timeout updates", async () => {
     const fixture = JSON.parse(
       readFileSync(
@@ -429,6 +503,7 @@ describe("WeixinAdapter", () => {
         status: "confirmed",
         bot_token: "new-token",
         ilink_bot_id: "bot-new",
+        ilink_user_id: "personal-user",
         baseurl: "https://new.example.test",
       }),
       getUpdates: async (input) => {
@@ -451,16 +526,32 @@ describe("WeixinAdapter", () => {
     });
     await vi.waitFor(() => expect(polledAccounts).toEqual(["bot-old"]));
     await adapter.startLogin();
-    await adapter.pollLogin();
+    await expect(adapter.pollLogin()).resolves.toEqual({
+      state: "confirmed",
+      accountId: "bot-new",
+      userId: "personal-user",
+    });
     await vi.waitFor(() =>
       expect(polledAccounts).toEqual(["bot-old", "bot-new"]),
     );
+    expect(adapter.getHealth()).toMatchObject({
+      state: "ready",
+      accountLabel: "bot-new",
+    });
+    expect(store.listActiveChannelAccounts()).toEqual([
+      {
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot-new",
+        userId: "personal-user",
+      },
+    ]);
 
     await adapter.stop();
     store.close();
   });
 
-  it("advances the cursor after a durable terminal admission rejection", async () => {
+  it("advances the cursor after every durable terminal admission rejection", async () => {
     vi.useFakeTimers();
     const directory = mkdtempSync(path.join(os.tmpdir(), "copilot-im-drop-"));
     temporaryDirectories.push(directory);
@@ -491,13 +582,19 @@ describe("WeixinAdapter", () => {
           delivered = true;
           return {
             messages: [
-              {
-                message_id: 1,
+              ...[
+                "sender-denied",
+                "route-denied",
+                "rate-limited",
+                "capacity-rejected",
+              ].map((clientId, index) => ({
+                message_id: index + 1,
+                client_id: clientId,
                 from_user_id: "sender",
                 message_type: 1,
                 context_token: "context",
                 item_list: [{ type: 1, text_item: { text: "denied" } }],
-              },
+              })),
             ],
             cursor: "cursor-after-denial",
             longPollingTimeoutMs: 35_000,
@@ -515,10 +612,20 @@ describe("WeixinAdapter", () => {
       sendText: async () => undefined,
     };
     const adapter = new WeixinAdapter({ store, protocol });
+    const terminalCodes = {
+      "sender-denied": gatewayErrorCodes.senderDenied,
+      "route-denied": gatewayErrorCodes.workspaceDenied,
+      "rate-limited": gatewayErrorCodes.rateLimited,
+      "capacity-rejected": gatewayErrorCodes.capacityExceeded,
+    } as const;
+    const rejected: string[] = [];
     await adapter.start({
-      onInbound: async () => {
+      onInbound: async (envelope) => {
+        rejected.push(envelope.messageId);
         throw new GatewayError({
-          code: gatewayErrorCodes.senderDenied,
+          code: terminalCodes[
+            envelope.messageId as keyof typeof terminalCodes
+          ],
           message: "denied",
           status: 403,
         });
@@ -536,6 +643,7 @@ describe("WeixinAdapter", () => {
         "updates-cursor",
       ),
     ).toBe("cursor-after-denial");
+    expect(rejected).toEqual(Object.keys(terminalCodes));
     await adapter.stop();
     store.close();
     vi.useRealTimers();
@@ -604,7 +712,7 @@ describe("WeixinAdapter", () => {
     store.close();
   });
 
-  it("does not advance the update cursor when batch processing fails", async () => {
+  it("does not advance the update cursor for a live admission reservation", async () => {
     vi.useFakeTimers();
     const directory = mkdtempSync(path.join(os.tmpdir(), "copilot-im-cursor-"));
     temporaryDirectories.push(directory);
@@ -665,7 +773,12 @@ describe("WeixinAdapter", () => {
     const adapter = new WeixinAdapter({ store, protocol });
     await adapter.start({
       onInbound: async () => {
-        throw new Error("transient inbound failure");
+        throw new GatewayError({
+          code: gatewayErrorCodes.messageAdmissionPending,
+          message: "still materializing",
+          status: 409,
+          retryable: true,
+        });
       },
       onHealth: async () => undefined,
     });

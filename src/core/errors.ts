@@ -9,6 +9,7 @@ export const gatewayErrorCodes = {
   conflict: "STATE_CONFLICT",
   internal: "INTERNAL_ERROR",
   invalidInput: "INVALID_INPUT",
+  messageAdmissionPending: "MESSAGE_ADMISSION_IN_PROGRESS",
   messageDuplicate: "MESSAGE_DUPLICATE",
   messageNotFound: "MESSAGE_NOT_FOUND",
   migrationRequired: "MIGRATION_AMBIGUOUS",
@@ -16,6 +17,7 @@ export const gatewayErrorCodes = {
   notFound: "NOT_FOUND",
   rateLimited: "RATE_LIMITED",
   senderDenied: "SENDER_NOT_ALLOWED",
+  upgradeRequired: "UPGRADE_REQUIRED",
   workspaceDenied: "WORKSPACE_NOT_ALLOWED",
 } as const;
 

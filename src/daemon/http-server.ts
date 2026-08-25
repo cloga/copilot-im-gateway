@@ -12,21 +12,30 @@ import { GatewayError, gatewayErrorCodes, toErrorEnvelope } from "../core/errors
 import { constantTimeTokenEqual } from "../core/security.js";
 import type { GatewayService } from "./gateway.js";
 import {
-  allowedSenderSchema,
-  adminApprovalDecisionSchema,
-  approvalConsumeSchema,
-  approvalDecisionSchema,
-  approvalRequestSchema,
-  bindingSchema,
-  completeMessageSchema,
-  inboundMessageSchema,
-  leaseRequestSchema,
-  loginPollSchema,
-  outboundMessageSchema,
-  workspaceAliasSchema,
+  legacyV1LoginPollSchema,
+  legacyV1WorkspaceAliasSchema,
+  v2AllowedSenderSchema,
+  v2AdminApprovalDecisionSchema,
+  v2ApprovalConsumeSchema,
+  v2ApprovalDecisionSchema,
+  v2ApprovalRequestSchema,
+  v2BindingSchema,
+  v2CompleteMessageSchema,
+  v2InboundMessageSchema,
+  v2LeaseRequestSchema,
+  v2LoginPollSchema,
+  v2OutboundMessageSchema,
+  v2WorkspaceAliasSchema,
 } from "./schemas.js";
 
 const maxBodyBytes = 1024 * 1024;
+export const gatewayApiVersion = 2;
+export const gatewayCapabilities = [
+  "account-scoped-routing",
+  "sender-bound-routing",
+  "operation-bound-approvals",
+  "reservation-ownership",
+] as const;
 
 export interface GatewayHttpServerOptions {
   service: GatewayService;
@@ -126,6 +135,24 @@ function authenticate(
   }
 }
 
+function isUnsafeLegacyV1Operation(method: string, pathname: string): boolean {
+  if (method !== "POST") {
+    return false;
+  }
+  return (
+    pathname === "/v1/allowed-senders" ||
+    pathname === "/v1/bindings" ||
+    pathname === "/v1/inbound" ||
+    pathname === "/v1/messages/lease" ||
+    /^\/v1\/messages\/\d+\/complete$/.test(pathname) ||
+    pathname === "/v1/outbound" ||
+    pathname === "/v1/approvals" ||
+    pathname === "/v1/approvals/decision" ||
+    pathname === "/v1/approvals/admin-decision" ||
+    pathname === "/v1/approvals/consume"
+  );
+}
+
 export async function startGatewayHttpServer(
   options: GatewayHttpServerOptions,
 ): Promise<RunningGatewayServer> {
@@ -198,7 +225,18 @@ async function handleRequest(
       sendJson(response, 200, options.service.getStatus());
       return;
     }
-    if (method === "GET" && pathname === "/v1/audit") {
+    if (method === "GET" && pathname === "/v2/status") {
+      sendJson(response, 200, {
+        apiVersion: gatewayApiVersion,
+        capabilities: gatewayCapabilities,
+        ...options.service.getStatus(),
+      });
+      return;
+    }
+    if (
+      method === "GET" &&
+      (pathname === "/v1/audit" || pathname === "/v2/audit")
+    ) {
       const limit = Math.min(
         500,
         Math.max(1, Number(requestUrl.searchParams.get("limit") ?? 100)),
@@ -206,8 +244,17 @@ async function handleRequest(
       sendJson(response, 200, { events: options.service.store.listAudit(limit) });
       return;
     }
-    if (method === "POST" && pathname === "/v1/workspace-aliases") {
-      const input = await readJson(request, workspaceAliasSchema);
+    if (
+      method === "POST" &&
+      (pathname === "/v1/workspace-aliases" ||
+        pathname === "/v2/workspace-aliases")
+    ) {
+      const input = await readJson(
+        request,
+        pathname.startsWith("/v1/")
+          ? legacyV1WorkspaceAliasSchema
+          : v2WorkspaceAliasSchema,
+      );
       const now = new Date().toISOString();
       options.service.store.upsertWorkspaceAlias(
         input.alias,
@@ -218,8 +265,44 @@ async function handleRequest(
       sendJson(response, 200, options.service.store.getWorkspaceAlias(input.alias));
       return;
     }
-    if (method === "POST" && pathname === "/v1/allowed-senders") {
-      const input = await readJson(request, allowedSenderSchema);
+    const loginStartMatch =
+      /^\/v1\/channels\/([^/]+)\/login\/start$/.exec(pathname) ??
+      /^\/v2\/channels\/([^/]+)\/login\/start$/.exec(pathname);
+    if (method === "POST" && loginStartMatch !== null) {
+      const channelId = decodeURIComponent(loginStartMatch[1] ?? "");
+      const snapshot = await options.service.getLoginChannel(channelId).startLogin();
+      sendJson(response, 200, snapshot);
+      return;
+    }
+    const loginPollMatch =
+      /^\/v1\/channels\/([^/]+)\/login\/poll$/.exec(pathname) ??
+      /^\/v2\/channels\/([^/]+)\/login\/poll$/.exec(pathname);
+    if (method === "POST" && loginPollMatch !== null) {
+      const channelId = decodeURIComponent(loginPollMatch[1] ?? "");
+      const input = await readJson(
+        request,
+        pathname.startsWith("/v1/")
+          ? legacyV1LoginPollSchema
+          : v2LoginPollSchema,
+      );
+      const snapshot = await options.service
+        .getLoginChannel(channelId)
+        .pollLogin(input.verifyCode);
+      sendJson(response, 200, snapshot);
+      return;
+    }
+
+    if (isUnsafeLegacyV1Operation(method, pathname)) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.upgradeRequired,
+        message:
+          "This operation requires the account-scoped v2 gateway extension.",
+        status: 426,
+      });
+    }
+
+    if (method === "POST" && pathname === "/v2/allowed-senders") {
+      const input = await readJson(request, v2AllowedSenderSchema);
       const now = new Date().toISOString();
       options.service.store.allowSender(
         {
@@ -234,8 +317,8 @@ async function handleRequest(
       sendJson(response, 201, { ok: true });
       return;
     }
-    if (method === "POST" && pathname === "/v1/bindings") {
-      const input = await readJson(request, bindingSchema);
+    if (method === "POST" && pathname === "/v2/bindings") {
+      const input = await readJson(request, v2BindingSchema);
       const workspace = options.service.store.getWorkspaceAlias(
         input.workspaceAlias,
       );
@@ -254,8 +337,8 @@ async function handleRequest(
       sendJson(response, 200, binding);
       return;
     }
-    if (method === "POST" && pathname === "/v1/inbound") {
-      const input = await readJson(request, inboundMessageSchema);
+    if (method === "POST" && pathname === "/v2/inbound") {
+      const input = await readJson(request, v2InboundMessageSchema);
       await options.service.onInbound(deferInboundMessage({
         tenantId: input.tenantId,
         channelId: input.channelId,
@@ -282,29 +365,8 @@ async function handleRequest(
       sendJson(response, 202, { accepted: true });
       return;
     }
-    const loginStartMatch = /^\/v1\/channels\/([^/]+)\/login\/start$/.exec(
-      pathname,
-    );
-    if (method === "POST" && loginStartMatch !== null) {
-      const channelId = decodeURIComponent(loginStartMatch[1] ?? "");
-      const snapshot = await options.service.getLoginChannel(channelId).startLogin();
-      sendJson(response, 200, snapshot);
-      return;
-    }
-    const loginPollMatch = /^\/v1\/channels\/([^/]+)\/login\/poll$/.exec(
-      pathname,
-    );
-    if (method === "POST" && loginPollMatch !== null) {
-      const channelId = decodeURIComponent(loginPollMatch[1] ?? "");
-      const input = await readJson(request, loginPollSchema);
-      const snapshot = await options.service
-        .getLoginChannel(channelId)
-        .pollLogin(input.verifyCode);
-      sendJson(response, 200, snapshot);
-      return;
-    }
-    if (method === "POST" && pathname === "/v1/messages/lease") {
-      const input = await readJson(request, leaseRequestSchema);
+    if (method === "POST" && pathname === "/v2/messages/lease") {
+      const input = await readJson(request, v2LeaseRequestSchema);
       const leased = options.service.leaseInbound(
         input.sessionId,
         input.leaseSeconds,
@@ -312,10 +374,10 @@ async function handleRequest(
       sendJson(response, 200, { message: leased ?? null });
       return;
     }
-    const completeMatch = /^\/v1\/messages\/(\d+)\/complete$/.exec(pathname);
+    const completeMatch = /^\/v2\/messages\/(\d+)\/complete$/.exec(pathname);
     if (method === "POST" && completeMatch !== null) {
       const id = Number(completeMatch[1]);
-      const input = await readJson(request, completeMessageSchema);
+      const input = await readJson(request, v2CompleteMessageSchema);
       options.service.completeInbound({
         id,
         leaseId: input.leaseId,
@@ -326,26 +388,26 @@ async function handleRequest(
       sendJson(response, 200, { ok: true });
       return;
     }
-    if (method === "POST" && pathname === "/v1/outbound") {
-      const input = await readJson(request, outboundMessageSchema);
+    if (method === "POST" && pathname === "/v2/outbound") {
+      const input = await readJson(request, v2OutboundMessageSchema);
       const chunks = await options.service.sendOutbound(input);
       sendJson(response, 202, { accepted: true, chunks });
       return;
     }
-    if (method === "POST" && pathname === "/v1/approvals") {
-      const input = await readJson(request, approvalRequestSchema);
+    if (method === "POST" && pathname === "/v2/approvals") {
+      const input = await readJson(request, v2ApprovalRequestSchema);
       const approval = options.service.createApproval(input);
       sendJson(response, 201, approval);
       return;
     }
-    if (method === "POST" && pathname === "/v1/approvals/decision") {
-      const input = await readJson(request, approvalDecisionSchema);
+    if (method === "POST" && pathname === "/v2/approvals/decision") {
+      const input = await readJson(request, v2ApprovalDecisionSchema);
       const record = options.service.decideApproval(input);
       sendJson(response, 200, record);
       return;
     }
-    if (method === "POST" && pathname === "/v1/approvals/admin-decision") {
-      const input = await readJson(request, adminApprovalDecisionSchema);
+    if (method === "POST" && pathname === "/v2/approvals/admin-decision") {
+      const input = await readJson(request, v2AdminApprovalDecisionSchema);
       const now = new Date().toISOString();
       const record = options.service.store.decideApprovalByRequestId({
         ...input,
@@ -354,8 +416,8 @@ async function handleRequest(
       sendJson(response, 200, record);
       return;
     }
-    if (method === "POST" && pathname === "/v1/approvals/consume") {
-      const input = await readJson(request, approvalConsumeSchema);
+    if (method === "POST" && pathname === "/v2/approvals/consume") {
+      const input = await readJson(request, v2ApprovalConsumeSchema);
       const record = options.service.store.consumeApproval({
         ...input,
         now: new Date().toISOString(),

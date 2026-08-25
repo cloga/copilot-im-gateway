@@ -22,6 +22,7 @@ import type {
   ApprovalRecord,
   GatewayStore,
   LeasedInboundMessage,
+  ReservedAdmissionResult,
 } from "./store.js";
 
 export class GatewayService implements ChannelContext {
@@ -126,27 +127,46 @@ export class GatewayService implements ChannelContext {
         );
       }
     } catch (error) {
-      try {
-        this.store.failMaterialization(
-          reservation,
-          envelope.messageId,
-          this.clock.now().toISOString(),
-        );
-      } catch (finalizationError) {
-        if (
-          !(
-            finalizationError instanceof GatewayError &&
-            finalizationError.code === gatewayErrorCodes.conflict
-          )
-        ) {
-          throw finalizationError;
+      const retryableReservationConflict =
+        error instanceof GatewayError &&
+        error.code === gatewayErrorCodes.conflict &&
+        error.retryable;
+      if (!retryableReservationConflict) {
+        try {
+          this.store.failMaterialization(
+            reservation,
+            envelope.messageId,
+            this.clock.now().toISOString(),
+          );
+        } catch (finalizationError) {
+          if (
+            !(
+              finalizationError instanceof GatewayError &&
+              finalizationError.code === gatewayErrorCodes.conflict
+            )
+          ) {
+            throw finalizationError;
+          }
         }
       }
       throw error;
     }
   }
 
-  #throwAdmissionError(admission: AdmissionResult): void {
+  #throwAdmissionError(
+    admission: AdmissionResult,
+  ): asserts admission is ReservedAdmissionResult | Extract<
+    AdmissionResult,
+    { disposition: "duplicate" }
+  > {
+    if (admission.disposition === "in_progress") {
+      throw new GatewayError({
+        code: gatewayErrorCodes.messageAdmissionPending,
+        message: "Inbound message admission is still being materialized.",
+        status: 409,
+        retryable: true,
+      });
+    }
     const disposition =
       admission.disposition === "duplicate"
         ? admission.previousDisposition
@@ -299,18 +319,39 @@ export class GatewayService implements ChannelContext {
   }
 
   getStatus(): {
-    channels: Array<{ id: string; kind: string; health: ChannelHealth }>;
+    channels: Array<{
+      id: string;
+      kind: string;
+      health: ChannelHealth;
+      login?: { accountId: string; userId?: string };
+    }>;
     bindings: ReturnType<GatewayStore["listBindings"]>;
     workspaceAliases: ReturnType<GatewayStore["listWorkspaceAliases"]>;
     allowedSenders: ReturnType<GatewayStore["listAllowedSenders"]>;
     pendingApprovals: ApprovalRecord[];
   } {
+    const activeAccounts = this.store.listActiveChannelAccounts();
     return {
-      channels: [...this.#adapters.values()].map((adapter) => ({
-        id: adapter.id,
-        kind: adapter.kind,
-        health: this.#health.get(adapter.id) ?? adapter.getHealth(),
-      })),
+      channels: [...this.#adapters.values()].map((adapter) => {
+        const account = activeAccounts.find(
+          (candidate) => candidate.channelId === adapter.id,
+        );
+        return {
+          id: adapter.id,
+          kind: adapter.kind,
+          health: this.#health.get(adapter.id) ?? adapter.getHealth(),
+          ...(account === undefined
+            ? {}
+            : {
+                login: {
+                  accountId: account.accountId,
+                  ...(account.userId === undefined
+                    ? {}
+                    : { userId: account.userId }),
+                },
+              }),
+        };
+      }),
       bindings: this.store.listBindings(),
       workspaceAliases: this.store.listWorkspaceAliases(),
       allowedSenders: this.store.listAllowedSenders(),

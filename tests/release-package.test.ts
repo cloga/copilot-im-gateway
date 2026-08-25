@@ -20,6 +20,42 @@ import {
 } from "../scripts/validate-release.mjs";
 
 describe("release packaging", () => {
+  it("keeps the v2 daemon and extension in one release compatibility unit", async () => {
+    expect(requiredEntries).toEqual(
+      expect.arrayContaining([
+        "package/dist/daemon/main.js",
+        "package/.github/extensions/im-gateway/gateway-client.mjs",
+        "package/.github/extensions/im-gateway/extension-runtime.mjs",
+      ]),
+    );
+    const root = path.resolve(import.meta.dirname, "..");
+    const daemon = await readFile(
+      path.join(root, "src", "daemon", "http-server.ts"),
+      "utf8",
+    );
+    const client = await readFile(
+      path.join(
+        root,
+        ".github",
+        "extensions",
+        "im-gateway",
+        "gateway-client.mjs",
+      ),
+      "utf8",
+    );
+    for (const capability of [
+      "account-scoped-routing",
+      "sender-bound-routing",
+      "operation-bound-approvals",
+      "reservation-ownership",
+    ]) {
+      expect(daemon).toContain(capability);
+      expect(client).toContain(capability);
+    }
+    expect(daemon).toContain("gatewayApiVersion = 2");
+    expect(client).toContain("supportedGatewayApiVersion = 2");
+  });
+
   it("rejects a repository without compiled daemon output", async () => {
     const root = await mkdtemp(
       path.join(os.tmpdir(), "copilot-im-gateway-missing-build-"),

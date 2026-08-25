@@ -1,6 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it, vi } from "vitest";
 import { GatewayService } from "../src/daemon/gateway.js";
 import { GatewayStore } from "../src/daemon/store.js";
@@ -35,12 +36,17 @@ describe("minimal inbound authorization", () => {
     expect(binding).not.toHaveBeenCalled();
     expect(finalize).not.toHaveBeenCalled();
     expect(context).not.toHaveBeenCalled();
-    const denial = store.listAudit().find(
-      (event) => event.eventType === "inbound.sender.denied",
-    );
-    expect(JSON.stringify(denial)).not.toContain("secret");
-
     store.close();
+    const database = new DatabaseSync(path.join(directory, "gateway.sqlite"));
+    const denial = database
+      .prepare(
+        `SELECT reason, route_key, sender_key, rejection_count
+         FROM admission_rejections`,
+      )
+      .get();
+    expect(denial).toMatchObject({ reason: "denied", rejection_count: 1 });
+    expect(JSON.stringify(denial)).not.toContain("secret");
+    database.close();
     rmSync(directory, { recursive: true, force: true });
   });
 
@@ -73,11 +79,17 @@ describe("minimal inbound authorization", () => {
       }),
     ).rejects.toMatchObject({ code: "WORKSPACE_NOT_ALLOWED" });
     expect(materialize).not.toHaveBeenCalled();
-    expect(
-      store.listAudit().some((event) => event.eventType === "inbound.route.denied"),
-    ).toBe(true);
-
     store.close();
+    const database = new DatabaseSync(path.join(directory, "gateway.sqlite"));
+    expect(
+      database
+        .prepare(
+          `SELECT reason, rejection_count FROM admission_rejections
+           WHERE reason = 'route_denied'`,
+        )
+        .get(),
+    ).toMatchObject({ reason: "route_denied", rejection_count: 1 });
+    database.close();
     rmSync(directory, { recursive: true, force: true });
   });
 

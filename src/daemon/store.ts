@@ -30,7 +30,7 @@ import {
   systemClock,
 } from "../core/security.js";
 
-const schemaVersion = 2;
+const schemaVersion = 3;
 
 interface CountRow {
   count: number;
@@ -76,6 +76,8 @@ export interface GatewayStoreOptions {
   retryMaxMs?: number;
   inboxRetentionDays?: number;
   auditRetentionDays?: number;
+  maxRejectionBuckets?: number;
+  rejectionRetentionDays?: number;
 }
 
 interface RequiredStoreOptions {
@@ -90,6 +92,8 @@ interface RequiredStoreOptions {
   retryMaxMs: number;
   inboxRetentionDays: number;
   auditRetentionDays: number;
+  maxRejectionBuckets: number;
+  rejectionRetentionDays: number;
 }
 
 export type AdmissionDisposition =
@@ -102,13 +106,36 @@ export type AdmissionDisposition =
   | "capacity_rejected"
   | "materialization_failed";
 
-export interface AdmissionResult {
-  disposition: AdmissionDisposition | "duplicate";
+export type RejectionDisposition =
+  | "denied"
+  | "route_denied"
+  | "rate_limited"
+  | "capacity_rejected";
+
+export interface ReservedAdmissionResult {
+  disposition: "reserved";
   routeKey: RouteKey;
-  reservationId?: string;
-  routeSequence?: number;
-  previousDisposition?: AdmissionDisposition;
+  reservationId: string;
+  routeSequence: number;
+  recovered?: true;
 }
+
+export type AdmissionResult =
+  | ReservedAdmissionResult
+  | {
+      disposition: "in_progress";
+      routeKey: RouteKey;
+      routeSequence: number;
+    }
+  | {
+      disposition: "duplicate";
+      routeKey: RouteKey;
+      previousDisposition: Exclude<AdmissionDisposition, "reserved">;
+    }
+  | {
+      disposition: RejectionDisposition;
+      routeKey: RouteKey;
+    };
 
 export interface LeasedInboundMessage {
   id: number;
@@ -146,6 +173,8 @@ export class GatewayStore {
   readonly #ownerId: string;
   readonly #options: RequiredStoreOptions;
   #closed = false;
+  #transactionDepth = 0;
+  #savepointSequence = 0;
 
   constructor(databasePath: string, options: GatewayStoreOptions = {}) {
     mkdirSync(path.dirname(databasePath), { recursive: true });
@@ -165,13 +194,20 @@ export class GatewayStore {
       retryMaxMs: options.retryMaxMs ?? 30_000,
       inboxRetentionDays: options.inboxRetentionDays ?? 14,
       auditRetentionDays: options.auditRetentionDays ?? 30,
+      maxRejectionBuckets: Math.min(
+        4_096,
+        Math.max(1, Math.floor(options.maxRejectionBuckets ?? 256)),
+      ),
+      rejectionRetentionDays: Math.min(
+        30,
+        Math.max(1, options.rejectionRetentionDays ?? 7),
+      ),
     };
     try {
       this.#database.exec(
         "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2500;",
       );
-      this.#migrate();
-      this.#acquireOwnership();
+      this.#initializeOwnedSchema();
     } catch (error) {
       this.#database.close();
       throw error;
@@ -200,13 +236,12 @@ export class GatewayStore {
         .prepare(
           `UPDATE gateway_ownership
            SET expires_at = ?, renewed_at = ?
-           WHERE singleton = 1 AND owner_token = ? AND expires_at > ?`,
+           WHERE singleton = 1 AND owner_token = ?`,
         )
         .run(
           new Date(now.getTime() + this.#options.ownershipLeaseMs).toISOString(),
           now.toISOString(),
           this.#ownerToken,
-          now.toISOString(),
         );
       if (result.changes !== 1) {
         throw this.#ownershipError();
@@ -219,7 +254,36 @@ export class GatewayStore {
   }
 
   #runImmediate<T>(operation: () => T, requireOwnership: boolean): T {
+    if (this.#transactionDepth > 0) {
+      const savepoint = `gateway_nested_${++this.#savepointSequence}`;
+      this.#database.exec(`SAVEPOINT ${savepoint}`);
+      this.#transactionDepth += 1;
+      try {
+        if (requireOwnership) {
+          this.#assertOwnership();
+        }
+        const result = operation();
+        this.#database.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        return result;
+      } catch (error) {
+        try {
+          this.#database.exec(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+        } catch {
+          // Preserve the operation failure even if SQLite cannot unwind.
+        }
+        try {
+          this.#database.exec(`RELEASE SAVEPOINT ${savepoint}`);
+        } catch {
+          // Preserve the operation failure even if SQLite cannot unwind.
+        }
+        throw error;
+      } finally {
+        this.#transactionDepth -= 1;
+      }
+    }
+
     this.#database.exec("BEGIN IMMEDIATE");
+    this.#transactionDepth = 1;
     try {
       if (requireOwnership) {
         this.#assertOwnership();
@@ -228,8 +292,14 @@ export class GatewayStore {
       this.#database.exec("COMMIT");
       return result;
     } catch (error) {
-      this.#database.exec("ROLLBACK");
+      try {
+        this.#database.exec("ROLLBACK");
+      } catch {
+        // Preserve the operation failure even if SQLite cannot unwind.
+      }
       throw error;
+    } finally {
+      this.#transactionDepth = 0;
     }
   }
 
@@ -268,24 +338,36 @@ export class GatewayStore {
     return localTenantId;
   }
 
-  #acquireOwnership(): void {
+  #initializeOwnedSchema(): void {
     this.#runImmediate(() => {
+      this.#assertOwnershipAvailable();
+      this.#migrate();
+      this.#acquireOwnership();
+    }, false);
+  }
+
+  #assertOwnershipAvailable(): void {
+    if (!this.#tableExists("gateway_ownership")) {
+      return;
+    }
+    const now = this.#clock.now().toISOString();
+    const current = this.#database
+      .prepare(
+        `SELECT owner_token, expires_at
+         FROM gateway_ownership WHERE singleton = 1`,
+      )
+      .get() as { owner_token: string; expires_at: string } | undefined;
+    if (
+      current !== undefined &&
+      current.owner_token !== this.#ownerToken &&
+      current.expires_at > now
+    ) {
+      throw this.#ownershipError();
+    }
+  }
+
+  #acquireOwnership(): void {
       const now = this.#clock.now();
-      const current = this.#database
-        .prepare(
-          `SELECT owner_token, owner_id, expires_at
-           FROM gateway_ownership WHERE singleton = 1`,
-        )
-        .get() as
-        | { owner_token: string; owner_id: string; expires_at: string }
-        | undefined;
-      if (
-        current !== undefined &&
-        current.owner_token !== this.#ownerToken &&
-        current.expires_at > now.toISOString()
-      ) {
-        throw this.#ownershipError();
-      }
       this.#database
         .prepare(
           `INSERT INTO gateway_ownership
@@ -303,11 +385,9 @@ export class GatewayStore {
           new Date(now.getTime() + this.#options.ownershipLeaseMs).toISOString(),
           now.toISOString(),
         );
-    }, false);
   }
 
   #migrate(): void {
-    this.#runImmediate(() => {
       const version = (
         this.#database.prepare("PRAGMA user_version").get() as {
           user_version: number;
@@ -321,11 +401,18 @@ export class GatewayStore {
         });
       }
       if (version === schemaVersion) {
+        this.#discardUncorrelatedRateEvents();
+        this.#repairAuditIndex();
         return;
       }
 
       const hasLegacy = this.#tableExists("inbound_messages");
       if (hasLegacy && !this.#columnExists("inbound_messages", "route_key")) {
+        this.#database.exec(`
+          DROP INDEX IF EXISTS idx_inbound_status;
+          DROP INDEX IF EXISTS idx_inbound_ready;
+          DROP INDEX IF EXISTS idx_audit_created_at;
+        `);
         for (const table of [
           "workspace_aliases",
           "allowed_senders",
@@ -343,6 +430,8 @@ export class GatewayStore {
         }
       }
 
+      this.#upgradeRuntimeColumns();
+      this.#discardUncorrelatedRateEvents();
       this.#createSchema();
       if (this.#tableExists("legacy_v1_workspace_aliases")) {
         this.#database.exec(
@@ -353,8 +442,8 @@ export class GatewayStore {
         );
         this.#quarantineLegacyTables();
       }
+      this.#repairAuditIndex();
       this.#database.exec(`PRAGMA user_version = ${schemaVersion}`);
-    }, false);
   }
 
   #tableExists(name: string): boolean {
@@ -372,6 +461,75 @@ export class GatewayStore {
       name: string;
     }>;
     return rows.some((row) => row.name === column);
+  }
+
+  #upgradeRuntimeColumns(): void {
+    if (
+      this.#tableExists("inbound_admissions") &&
+      !this.#columnExists("inbound_admissions", "reservation_owner_token")
+    ) {
+      this.#database.exec(
+        "ALTER TABLE inbound_admissions ADD COLUMN reservation_owner_token TEXT",
+      );
+    }
+    if (
+      this.#tableExists("rate_events") &&
+      !this.#columnExists("rate_events", "route_key")
+    ) {
+      this.#database.exec("ALTER TABLE rate_events ADD COLUMN route_key TEXT");
+    }
+    if (
+      this.#tableExists("rate_events") &&
+      !this.#columnExists("rate_events", "message_id_hash")
+    ) {
+      this.#database.exec(
+        "ALTER TABLE rate_events ADD COLUMN message_id_hash TEXT",
+      );
+    }
+  }
+
+  #discardUncorrelatedRateEvents(): void {
+    if (
+      this.#tableExists("rate_events") &&
+      this.#columnExists("rate_events", "route_key") &&
+      this.#columnExists("rate_events", "message_id_hash")
+    ) {
+      this.#database
+        .prepare(
+          `DELETE FROM rate_events
+           WHERE route_key IS NULL OR message_id_hash IS NULL`,
+        )
+        .run();
+    }
+  }
+
+  #repairAuditIndex(): void {
+    if (!this.#tableExists("audit_events")) {
+      return;
+    }
+    const existing = this.#database
+      .prepare(
+        `SELECT tbl_name FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_audit_created_at'`,
+      )
+      .get() as { tbl_name: string } | undefined;
+    const columns =
+      existing === undefined
+        ? []
+        : (this.#database
+            .prepare("PRAGMA index_info(idx_audit_created_at)")
+            .all() as Array<{ name: string }>).map((column) => column.name);
+    if (
+      existing?.tbl_name === "audit_events" &&
+      columns.length === 1 &&
+      columns[0] === "created_at"
+    ) {
+      return;
+    }
+    this.#database.exec(`
+      DROP INDEX IF EXISTS idx_audit_created_at;
+      CREATE INDEX idx_audit_created_at ON audit_events(created_at DESC);
+    `);
   }
 
   #createSchema(): void {
@@ -416,6 +574,7 @@ export class GatewayStore {
            'capacity_rejected','materialization_failed')),
         reservation_id TEXT,
         reservation_expires_at TEXT,
+        reservation_owner_token TEXT,
         route_sequence INTEGER,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
@@ -451,10 +610,28 @@ export class GatewayStore {
         ON inbound_messages(status, available_at, route_key, route_sequence);
       CREATE TABLE IF NOT EXISTS rate_events (
         sender_key TEXT NOT NULL,
-        occurred_at TEXT NOT NULL
+        occurred_at TEXT NOT NULL,
+        route_key TEXT,
+        message_id_hash TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_rate_events
         ON rate_events(sender_key, occurred_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_rate_event_admission
+        ON rate_events(route_key, message_id_hash)
+        WHERE route_key IS NOT NULL AND message_id_hash IS NOT NULL;
+      CREATE TABLE IF NOT EXISTS admission_rejections (
+        slot INTEGER PRIMARY KEY,
+        bucket_hash TEXT NOT NULL UNIQUE,
+        route_key TEXT NOT NULL,
+        sender_key TEXT NOT NULL,
+        reason TEXT NOT NULL CHECK (reason IN
+          ('denied','route_denied','rate_limited','capacity_rejected')),
+        rejection_count INTEGER NOT NULL,
+        first_at TEXT NOT NULL,
+        last_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_admission_rejections_last_at
+        ON admission_rejections(last_at);
       CREATE TABLE IF NOT EXISTS approvals (
         request_id TEXT PRIMARY KEY,
         nonce_hash TEXT NOT NULL UNIQUE,
@@ -836,7 +1013,7 @@ export class GatewayStore {
       const existing = this.#database
         .prepare(
           `SELECT disposition, reservation_id, reservation_expires_at,
-                  route_sequence
+                  reservation_owner_token, route_sequence
            FROM inbound_admissions
            WHERE route_key = ? AND message_id_hash = ?`,
         )
@@ -845,74 +1022,47 @@ export class GatewayStore {
             disposition: AdmissionDisposition;
             reservation_id: string | null;
             reservation_expires_at: string | null;
+            reservation_owner_token: string | null;
             route_sequence: number | null;
           }
         | undefined;
       if (existing !== undefined) {
-        if (
-          existing.disposition === "reserved" &&
-          existing.reservation_expires_at !== null &&
-          existing.reservation_expires_at <= now
-        ) {
-          const reservationId = randomUUID();
-          this.#database
-            .prepare(
-              `UPDATE inbound_admissions
-               SET reservation_id = ?, reservation_expires_at = ?, updated_at = ?
-               WHERE route_key = ? AND message_id_hash = ?`,
-            )
-            .run(
-              reservationId,
-              new Date(
-                new Date(now).getTime() + this.#options.reservationLeaseMs,
-              ).toISOString(),
-              now,
-              routeKey,
-              messageIdHash,
-            );
+        if (existing.disposition !== "reserved") {
           return {
-            disposition: "reserved",
+            disposition: "duplicate",
             routeKey,
-            reservationId,
-            ...(existing.route_sequence === null
-              ? {}
-              : { routeSequence: existing.route_sequence }),
+            previousDisposition: existing.disposition,
           };
         }
-        return {
-          disposition: "duplicate",
-          routeKey,
-          previousDisposition: existing.disposition,
-        };
+        if (
+          existing.reservation_owner_token === this.#ownerToken &&
+          existing.reservation_expires_at !== null &&
+          existing.reservation_expires_at > now
+        ) {
+          if (existing.route_sequence === null) {
+            throw new GatewayError({
+              code: gatewayErrorCodes.migrationRequired,
+              message: "Live inbound reservation has no durable route sequence.",
+              status: 409,
+            });
+          }
+          return {
+            disposition: "in_progress",
+            routeKey,
+            routeSequence: existing.route_sequence,
+          };
+        }
       }
 
       if (!this.isSenderAllowed(envelope.identity)) {
-        this.#insertAdmission(
+        return this.#rejectAdmission(
+          envelope.identity,
           routeKey,
           messageIdHash,
           "denied",
-          null,
-          null,
-          null,
           now,
+          existing,
         );
-        this.#insertAudit({
-          createdAt: now,
-          eventType: "inbound.sender.denied",
-          actor: `sender-hash:${hashSecret(envelope.identity.senderId, "sender-id")}`,
-          routeKey,
-          details: {
-            tenantHash: hashSecret(envelope.identity.tenantId, "tenant-id"),
-            channelHash: hashSecret(envelope.identity.channelId, "channel-id"),
-            accountHash: hashSecret(envelope.identity.accountId, "account-id"),
-            conversationHash: hashSecret(
-              envelope.identity.conversationId,
-              "conversation-id",
-            ),
-            messageHash: messageIdHash,
-          },
-        });
-        return { disposition: "denied", routeKey };
       }
 
       const authorizedBinding = this.#database
@@ -924,34 +1074,17 @@ export class GatewayStore {
         )
         .get(routeKey);
       if (authorizedBinding === undefined) {
-        this.#insertAdmission(
-          routeKey,
-          messageIdHash,
-          "route_denied",
-          null,
-          null,
-          null,
-          now,
+        return this.#rejectAdmission(
+         envelope.identity,
+         routeKey,
+         messageIdHash,
+         "route_denied",
+         now,
+         existing,
         );
-        this.#insertAudit({
-          createdAt: now,
-          eventType: "inbound.route.denied",
-          actor: `sender-hash:${hashSecret(envelope.identity.senderId, "sender-id")}`,
-          routeKey,
-          details: { messageHash: messageIdHash },
-        });
-        return { disposition: "route_denied", routeKey };
       }
 
-      const senderKey = hashSecret(
-        canonicalizeIdentityComponents([
-          envelope.identity.tenantId,
-          envelope.identity.channelId,
-          envelope.identity.accountId,
-          envelope.identity.senderId,
-        ]),
-        "rate-limit-sender",
-      );
+      const senderKey = this.#senderKey(envelope.identity);
       const cutoff = new Date(
         new Date(now).getTime() - this.#options.rateWindowMs,
       ).toISOString();
@@ -962,76 +1095,248 @@ export class GatewayStore {
         this.#database
           .prepare(
             `SELECT COUNT(*) AS count FROM rate_events
-             WHERE sender_key = ? AND occurred_at > ?`,
+             WHERE sender_key = ? AND occurred_at > ?
+               AND route_key IS NOT NULL AND message_id_hash IS NOT NULL
+               AND (route_key <> ? OR message_id_hash <> ?)`,
           )
-          .get(senderKey, cutoff) as unknown as CountRow
+          .get(senderKey, cutoff, routeKey, messageIdHash) as unknown as CountRow
       ).count;
       if (rateCount >= this.#options.rateLimit) {
-        this.#insertAdmission(
+        return this.#rejectAdmission(
+          envelope.identity,
           routeKey,
           messageIdHash,
           "rate_limited",
-          null,
-          null,
-          null,
           now,
+          existing,
         );
-        this.#insertAudit({
-          createdAt: now,
-          eventType: "inbound.rate_limited",
-          actor: `sender-hash:${hashSecret(envelope.identity.senderId, "sender-id")}`,
-          routeKey,
-          details: { messageHash: messageIdHash },
-        });
-        return { disposition: "rate_limited", routeKey };
       }
 
-      const globalPending = this.#pendingCount(now);
-      const routePending = this.#pendingCount(now, routeKey);
+      const exclusion = { routeKey, messageIdHash };
+      const globalPending = this.#pendingCount(now, undefined, exclusion);
+      const routePending = this.#pendingCount(now, routeKey, exclusion);
       if (
         globalPending >= this.#options.maxPendingGlobal ||
         routePending >= this.#options.maxPendingPerRoute
       ) {
-        this.#insertAdmission(
+        return this.#rejectAdmission(
+          envelope.identity,
           routeKey,
           messageIdHash,
           "capacity_rejected",
-          null,
-          null,
-          null,
           now,
+          existing,
         );
-        this.#insertAudit({
-          createdAt: now,
-          eventType: "inbound.capacity_rejected",
-          actor: "system:admission",
-          routeKey,
-          details: { globalPending, routePending },
-        });
-        return { disposition: "capacity_rejected", routeKey };
       }
 
       this.#database
-        .prepare("INSERT INTO rate_events (sender_key, occurred_at) VALUES (?, ?)")
-        .run(senderKey, now);
+        .prepare(
+          `INSERT OR REPLACE INTO rate_events
+            (sender_key, occurred_at, route_key, message_id_hash)
+          VALUES (?, ?, ?, ?)`,
+        )
+        .run(senderKey, now, routeKey, messageIdHash);
       const reservationId = randomUUID();
-      const routeSequence = this.#nextSequence(routeKey);
-      this.#insertAdmission(
+      const reservationExpiresAt = new Date(
+        new Date(now).getTime() + this.#options.reservationLeaseMs,
+      ).toISOString();
+      const routeSequence =
+        existing?.route_sequence ?? this.#nextSequence(routeKey);
+      if (existing === undefined) {
+        this.#insertAdmission(
+          routeKey,
+          messageIdHash,
+          "reserved",
+          reservationId,
+          reservationExpiresAt,
+          this.#ownerToken,
+          routeSequence,
+          now,
+        );
+      } else {
+        const result = this.#database
+          .prepare(
+           `UPDATE inbound_admissions
+            SET reservation_id = ?, reservation_expires_at = ?,
+                reservation_owner_token = ?, route_sequence = ?, updated_at = ?
+            WHERE route_key = ? AND message_id_hash = ?
+              AND disposition = 'reserved'`,
+          )
+          .run(
+           reservationId,
+           reservationExpiresAt,
+           this.#ownerToken,
+           routeSequence,
+           now,
+           routeKey,
+           messageIdHash,
+          );
+        if (result.changes !== 1) {
+          throw new GatewayError({
+           code: gatewayErrorCodes.conflict,
+           message: "Inbound reservation changed during recovery.",
+           status: 409,
+           retryable: true,
+          });
+        }
+        this.#insertAudit({
+          createdAt: now,
+          eventType: "inbound.reservation_reclaimed",
+          actor: "system:recovery",
+          routeKey,
+          details: {
+           sequence: routeSequence,
+           reason:
+             existing.reservation_owner_token === this.#ownerToken
+               ? "expired"
+               : "owner_replaced",
+          },
+        });
+      }
+      return {
+        disposition: "reserved",
         routeKey,
-        messageIdHash,
-        "reserved",
         reservationId,
-        new Date(
-          new Date(now).getTime() + this.#options.reservationLeaseMs,
-        ).toISOString(),
         routeSequence,
-        now,
-      );
-      return { disposition: "reserved", routeKey, reservationId, routeSequence };
+        ...(existing === undefined ? {} : { recovered: true }),
+      };
     });
   }
 
-  #pendingCount(now: string, routeKey?: RouteKey): number {
+  #senderKey(identity: RouteIdentity): string {
+    return hashSecret(
+      canonicalizeIdentityComponents([
+        identity.tenantId,
+        identity.channelId,
+        identity.accountId,
+        identity.senderId,
+      ]),
+      "rate-limit-sender",
+    );
+  }
+
+  #rejectAdmission(
+    identity: RouteIdentity,
+    routeKey: RouteKey,
+    messageIdHash: string,
+    disposition: RejectionDisposition,
+    now: string,
+    existing:
+      | {
+          disposition: AdmissionDisposition;
+          reservation_id: string | null;
+          reservation_expires_at: string | null;
+          reservation_owner_token: string | null;
+          route_sequence: number | null;
+        }
+      | undefined,
+  ): AdmissionResult {
+    if (existing !== undefined) {
+      const result = this.#database
+        .prepare(
+          `UPDATE inbound_admissions
+          SET disposition = ?, reservation_id = NULL,
+              reservation_expires_at = NULL,
+              reservation_owner_token = NULL, updated_at = ?
+          WHERE route_key = ? AND message_id_hash = ?
+            AND disposition = 'reserved'`,
+        )
+        .run(disposition, now, routeKey, messageIdHash);
+      if (result.changes !== 1) {
+        throw new GatewayError({
+          code: gatewayErrorCodes.conflict,
+          message: "Inbound reservation changed during policy recovery.",
+          status: 409,
+          retryable: true,
+        });
+      }
+    }
+    this.#recordRejection(identity, routeKey, disposition, now);
+    return { disposition, routeKey };
+  }
+
+  #recordRejection(
+    identity: RouteIdentity,
+    routeKey: RouteKey,
+    reason: RejectionDisposition,
+    now: string,
+  ): void {
+    const cutoff = new Date(
+      new Date(now).getTime() -
+        this.#options.rejectionRetentionDays * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    this.#database
+      .prepare("DELETE FROM admission_rejections WHERE last_at < ?")
+      .run(cutoff);
+    const senderKey = this.#senderKey(identity);
+    const bucketHash = hashSecret(
+      canonicalizeIdentityComponents([routeKey, senderKey, reason]),
+      "admission-rejection-bucket",
+    );
+    const updated = this.#database
+      .prepare(
+        `UPDATE admission_rejections
+         SET rejection_count = rejection_count + 1, last_at = ?
+         WHERE bucket_hash = ?`,
+      )
+      .run(now, bucketHash);
+    if (updated.changes === 1) {
+      return;
+    }
+    const count = (
+      this.#database
+        .prepare("SELECT COUNT(*) AS count FROM admission_rejections")
+        .get() as unknown as CountRow
+    ).count;
+    if (count < this.#options.maxRejectionBuckets) {
+      const nextSlot = (
+        this.#database
+          .prepare(
+           "SELECT COALESCE(MAX(slot), 0) + 1 AS slot FROM admission_rejections",
+          )
+          .get() as { slot: number }
+      ).slot;
+      this.#database
+        .prepare(
+          `INSERT INTO admission_rejections
+            (slot, bucket_hash, route_key, sender_key, reason,
+             rejection_count, first_at, last_at)
+          VALUES (?, ?, ?, ?, ?, 1, ?, ?)`,
+        )
+        .run(nextSlot, bucketHash, routeKey, senderKey, reason, now, now);
+      return;
+    }
+    const oldest = this.#database
+      .prepare(
+        `SELECT slot FROM admission_rejections
+         ORDER BY last_at, slot LIMIT 1`,
+      )
+      .get() as { slot: number } | undefined;
+    if (oldest !== undefined) {
+      this.#database
+        .prepare(
+          `UPDATE admission_rejections
+          SET bucket_hash = ?, route_key = ?, sender_key = ?, reason = ?,
+              rejection_count = 1, first_at = ?, last_at = ?
+          WHERE slot = ?`,
+        )
+        .run(
+          bucketHash,
+          routeKey,
+          senderKey,
+          reason,
+          now,
+          now,
+          oldest.slot,
+        );
+    }
+  }
+
+  #pendingCount(
+    now: string,
+    routeKey?: RouteKey,
+    exclusion?: { routeKey: RouteKey; messageIdHash: string },
+  ): number {
     const messageQuery =
       routeKey === undefined
         ? `SELECT COUNT(*) AS count FROM inbound_messages
@@ -1041,10 +1346,12 @@ export class GatewayStore {
     const reservationQuery =
       routeKey === undefined
         ? `SELECT COUNT(*) AS count FROM inbound_admissions
-           WHERE disposition = 'reserved' AND reservation_expires_at > ?`
+           WHERE disposition = 'reserved' AND reservation_expires_at > ?
+             AND NOT (route_key = ? AND message_id_hash = ?)`
         : `SELECT COUNT(*) AS count FROM inbound_admissions
            WHERE route_key = ? AND disposition = 'reserved'
-             AND reservation_expires_at > ?`;
+             AND reservation_expires_at > ?
+             AND NOT (route_key = ? AND message_id_hash = ?)`;
     const messages = (
       (routeKey === undefined
         ? this.#database.prepare(messageQuery).get()
@@ -1052,10 +1359,21 @@ export class GatewayStore {
     ).count;
     const reservations = (
       (routeKey === undefined
-        ? this.#database.prepare(reservationQuery).get(now)
+        ? this.#database
+            .prepare(reservationQuery)
+            .get(
+              now,
+              exclusion?.routeKey ?? "",
+              exclusion?.messageIdHash ?? "",
+            )
         : this.#database
             .prepare(reservationQuery)
-            .get(routeKey, now)) as unknown as CountRow
+            .get(
+              routeKey,
+              now,
+              exclusion?.routeKey ?? "",
+              exclusion?.messageIdHash ?? "",
+            )) as unknown as CountRow
     ).count;
     return messages + reservations;
   }
@@ -1066,6 +1384,7 @@ export class GatewayStore {
     disposition: AdmissionDisposition,
     reservationId: string | null,
     reservationExpiresAt: string | null,
+    reservationOwnerToken: string | null,
     routeSequence: number | null,
     now: string,
   ): void {
@@ -1073,8 +1392,9 @@ export class GatewayStore {
       .prepare(
         `INSERT INTO inbound_admissions
            (route_key, message_id_hash, disposition, reservation_id,
-            reservation_expires_at, route_sequence, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            reservation_expires_at, reservation_owner_token, route_sequence,
+            created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         routeKey,
@@ -1082,6 +1402,7 @@ export class GatewayStore {
         disposition,
         reservationId,
         reservationExpiresAt,
+        reservationOwnerToken,
         routeSequence,
         now,
         now,
@@ -1089,20 +1410,12 @@ export class GatewayStore {
   }
 
   finalizeInbound(
-    reservation: AdmissionResult,
+    reservation: ReservedAdmissionResult,
     message: ImInboundMessage,
     now: string,
   ): boolean {
     return this.transaction(() => {
-      this.#validateReservation(reservation, message, now);
-      const sequence = reservation.routeSequence;
-      if (sequence === undefined) {
-        throw new GatewayError({
-          code: gatewayErrorCodes.conflict,
-          message: "Inbound reservation has no durable route sequence.",
-          status: 409,
-        });
-      }
+      const sequence = this.#validateReservation(reservation, message, now);
       const result = this.#database
         .prepare(
           `INSERT OR IGNORE INTO inbound_messages
@@ -1149,11 +1462,12 @@ export class GatewayStore {
   }
 
   failMaterialization(
-    reservation: AdmissionResult,
+    reservation: ReservedAdmissionResult,
     messageId: string,
     now: string,
   ): void {
     this.transaction(() => {
+      this.#validateReservationOwnership(reservation, messageId, now);
       this.#finishAdmission(
         reservation,
         messageId,
@@ -1170,35 +1484,52 @@ export class GatewayStore {
   }
 
   #validateReservation(
-    reservation: AdmissionResult,
+    reservation: ReservedAdmissionResult,
     message: ImInboundMessage,
     now: string,
-  ): void {
-    if (
-      reservation.disposition !== "reserved" ||
-      reservation.reservationId === undefined ||
-      toRouteKey(message) !== reservation.routeKey
-    ) {
+  ): number {
+    if (toRouteKey(message) !== reservation.routeKey) {
       throw new GatewayError({
         code: gatewayErrorCodes.conflict,
         message: "Inbound reservation does not match the materialized message.",
         status: 409,
       });
     }
+    return this.#validateReservationOwnership(
+      reservation,
+      message.messageId,
+      now,
+    );
+  }
+
+  #validateReservationOwnership(
+    reservation: ReservedAdmissionResult,
+    messageId: string,
+    now: string,
+  ): number {
     const row = this.#database
       .prepare(
-        `SELECT reservation_id, reservation_expires_at
+        `SELECT reservation_id, reservation_expires_at, reservation_owner_token,
+                route_sequence
          FROM inbound_admissions
          WHERE route_key = ? AND message_id_hash = ? AND disposition = 'reserved'`,
       )
       .get(
         reservation.routeKey,
-        hashSecret(message.messageId, "message-id"),
+        hashSecret(messageId, "message-id"),
       ) as
-      | { reservation_id: string; reservation_expires_at: string }
+      | {
+          reservation_id: string | null;
+          reservation_expires_at: string | null;
+          reservation_owner_token: string | null;
+          route_sequence: number | null;
+        }
       | undefined;
     if (
-      row?.reservation_id !== reservation.reservationId ||
+      row === undefined ||
+      row.reservation_id !== reservation.reservationId ||
+      row.reservation_owner_token !== this.#ownerToken ||
+      row.reservation_expires_at === null ||
       row.reservation_expires_at <= now
     ) {
       throw new GatewayError({
@@ -1208,6 +1539,14 @@ export class GatewayStore {
         retryable: true,
       });
     }
+    if (row.route_sequence === null) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.migrationRequired,
+        message: "Inbound reservation has no durable route sequence.",
+        status: 409,
+      });
+    }
+    return row.route_sequence;
   }
 
   #nextSequence(routeKey: RouteKey): number {
@@ -1231,7 +1570,7 @@ export class GatewayStore {
   }
 
   #finishAdmission(
-    reservation: AdmissionResult,
+    reservation: ReservedAdmissionResult,
     messageId: string,
     disposition: AdmissionDisposition,
     now: string,
@@ -1240,35 +1579,40 @@ export class GatewayStore {
       .prepare(
         `UPDATE inbound_admissions
          SET disposition = ?, reservation_id = NULL,
-             reservation_expires_at = NULL, updated_at = ?
+             reservation_expires_at = NULL,
+             reservation_owner_token = NULL, updated_at = ?
          WHERE route_key = ? AND message_id_hash = ?
-           AND disposition = 'reserved' AND reservation_id = ?`,
+           AND disposition = 'reserved' AND reservation_id = ?
+           AND reservation_owner_token = ? AND reservation_expires_at > ?`,
       )
       .run(
         disposition,
         now,
         reservation.routeKey,
         hashSecret(messageId, "message-id"),
-        reservation.reservationId ?? null,
+        reservation.reservationId,
+        this.#ownerToken,
+        now,
       );
     if (result.changes !== 1) {
       throw new GatewayError({
         code: gatewayErrorCodes.conflict,
         message: "Inbound reservation is no longer active.",
         status: 409,
+        retryable: true,
       });
     }
   }
 
   finalizeApprovalCommand(
-    reservation: AdmissionResult,
+    reservation: ReservedAdmissionResult,
     message: ImInboundMessage,
     nonce: string,
     decision: "approved" | "denied",
     now: string,
   ): ApprovalRecord {
     return this.transaction(() => {
-      this.#validateReservation(reservation, message, now);
+      const sequence = this.#validateReservation(reservation, message, now);
       const binding = this.#getBinding(reservation.routeKey);
       if (binding === undefined) {
         throw new GatewayError({
@@ -1286,14 +1630,6 @@ export class GatewayStore {
         sessionId: binding.sessionId,
       };
       const record = this.#decideApproval(nonce, identity, decision, now);
-      const sequence = reservation.routeSequence;
-      if (sequence === undefined) {
-        throw new GatewayError({
-          code: gatewayErrorCodes.conflict,
-          message: "Inbound reservation has no durable route sequence.",
-          status: 409,
-        });
-      }
       this.#database
         .prepare(
           `INSERT INTO inbound_messages
@@ -1336,6 +1672,7 @@ export class GatewayStore {
     leaseSeconds: number,
   ): LeasedInboundMessage | undefined {
     return this.transaction(() => {
+      this.#expireReservationBarriers(now);
       this.#recoverExpiredLeases(now);
       const row = this.#database
         .prepare(
@@ -1414,6 +1751,45 @@ export class GatewayStore {
         },
       };
     });
+  }
+
+  #expireReservationBarriers(now: string): void {
+    const rows = this.#database
+      .prepare(
+        `SELECT route_key, message_id_hash, route_sequence
+         FROM inbound_admissions
+         WHERE disposition = 'reserved' AND reservation_expires_at <= ?`,
+      )
+      .all(now) as Array<{
+      route_key: string;
+      message_id_hash: string;
+      route_sequence: number | null;
+    }>;
+    for (const row of rows) {
+      const expired = this.#database
+        .prepare(
+          `UPDATE inbound_admissions
+           SET disposition = 'materialization_failed',
+               reservation_id = NULL, reservation_expires_at = NULL,
+               reservation_owner_token = NULL, updated_at = ?
+           WHERE route_key = ? AND message_id_hash = ?
+             AND disposition = 'reserved' AND reservation_expires_at <= ?`,
+        )
+        .run(now, row.route_key, row.message_id_hash, now);
+      if (expired.changes === 1) {
+        this.#insertAudit({
+          createdAt: now,
+          eventType: "inbound.reservation_expired",
+          actor: "system:recovery",
+          routeKey: row.route_key as RouteKey,
+          details: {
+            ...(row.route_sequence === null
+              ? {}
+              : { sequence: row.route_sequence }),
+          },
+        });
+      }
+    }
   }
 
   #recoverExpiredLeases(now: string): void {
@@ -1972,8 +2348,44 @@ export class GatewayStore {
         };
   }
 
-  cleanup(now: string): { inbox: number; audit: number } {
+  listActiveChannelAccounts(): Array<{
+    tenantId: TenantId;
+    channelId: string;
+    accountId: string;
+    userId?: string;
+  }> {
+    const rows = this.#database
+      .prepare(
+        `SELECT a.tenant_id, a.channel_id, a.account_id,
+                CASE WHEN json_type(s.value_json, '$.userId') = 'text'
+                  THEN json_extract(s.value_json, '$.userId')
+                  ELSE NULL
+                END AS user_id
+         FROM active_channel_accounts a
+         JOIN channel_state s
+           ON s.tenant_id = a.tenant_id
+          AND s.channel_id = a.channel_id
+          AND s.account_id = a.account_id
+          AND s.state_key = 'credentials'
+         ORDER BY a.tenant_id, a.channel_id`,
+      )
+      .all() as Array<{
+      tenant_id: string;
+      channel_id: string;
+      account_id: string;
+      user_id: string | null;
+    }>;
+    return rows.map((row) => ({
+      tenantId: this.#localTenant(row.tenant_id),
+      channelId: row.channel_id,
+      accountId: row.account_id,
+      ...(row.user_id === null ? {} : { userId: row.user_id }),
+    }));
+  }
+
+  cleanup(now: string): { inbox: number; audit: number; rejections: number } {
     return this.transaction(() => {
+      this.#expireReservationBarriers(now);
       const inboxCutoff = new Date(
         new Date(now).getTime() -
           this.#options.inboxRetentionDays * 24 * 60 * 60 * 1000,
@@ -1992,13 +2404,24 @@ export class GatewayStore {
       const audit = this.#database
         .prepare("DELETE FROM audit_events WHERE created_at < ?")
         .run(auditCutoff).changes;
+      const rejectionCutoff = new Date(
+        new Date(now).getTime() -
+          this.#options.rejectionRetentionDays * 24 * 60 * 60 * 1000,
+      ).toISOString();
+      const rejections = this.#database
+        .prepare("DELETE FROM admission_rejections WHERE last_at < ?")
+        .run(rejectionCutoff).changes;
       this.#database
         .prepare(
           `DELETE FROM inbound_admissions
            WHERE updated_at < ? AND disposition <> 'reserved'`,
         )
         .run(inboxCutoff);
-      return { inbox: Number(inbox), audit: Number(audit) };
+      return {
+        inbox: Number(inbox),
+        audit: Number(audit),
+        rejections: Number(rejections),
+      };
     });
   }
 }

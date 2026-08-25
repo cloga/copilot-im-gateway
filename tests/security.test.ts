@@ -5,7 +5,11 @@ import {
   isPathInside,
   redactText,
 } from "../src/core/security.js";
-import { toRouteKey } from "../src/core/contracts.js";
+import { isWellFormedUnicode, toRouteKey } from "../src/core/contracts.js";
+import {
+  v2AllowedSenderSchema,
+  v2ApprovalRequestSchema,
+} from "../src/daemon/schemas.js";
 
 describe("security primitives", () => {
   it("compares bearer tokens without length timing differences", () => {
@@ -49,6 +53,75 @@ describe("security primitives", () => {
     expect(toRouteKey(route)).not.toBe(
       toRouteKey({ ...route, accountId: "other" }),
     );
+  });
+
+  it("rejects ill-formed Unicode before route hashing without conflating U+FFFD", () => {
+    const route = {
+      tenantId: "local" as const,
+      channelId: "weixin-main",
+      accountId: "bot",
+      conversationId: "conversation",
+      senderId: "\uFFFD",
+    };
+    expect(isWellFormedUnicode(route.senderId)).toBe(true);
+    expect(toRouteKey(route)).not.toBe(toRouteKey({ ...route, senderId: "?" }));
+    expect(() => toRouteKey({ ...route, senderId: "\uD800" })).toThrow(
+      "well-formed Unicode",
+    );
+    expect(
+      v2AllowedSenderSchema.safeParse({
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot",
+        senderId: "\uFFFD",
+      }).success,
+    ).toBe(true);
+    expect(
+      v2AllowedSenderSchema.safeParse({
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot",
+        senderId: "\uD800",
+      }).success,
+    ).toBe(false);
+  });
+
+  it("rejects ill-formed Unicode throughout approval scopes", () => {
+    const request = {
+      requestId: "request",
+      identity: {
+        tenantId: "local",
+        channelId: "weixin-main",
+        accountId: "bot",
+        conversationId: "conversation",
+        senderId: "sender",
+        sessionId: "session",
+      },
+      scope: {
+        kind: "write",
+        summary: "Write a file",
+        paths: ["personal/file.txt"],
+        hosts: ["example.test"],
+        commands: ["write"],
+      },
+      ttlSeconds: 300,
+    };
+    for (const scope of [
+      { ...request.scope, summary: "\uD800" },
+      { ...request.scope, paths: ["\uD800"] },
+      { ...request.scope, hosts: ["\uD800"] },
+      { ...request.scope, commands: ["\uD800"] },
+    ]) {
+      expect(v2ApprovalRequestSchema.safeParse({ ...request, scope }).success).toBe(
+        false,
+      );
+    }
+    expect(
+      v2ApprovalRequestSchema.safeParse({
+        ...request,
+        scope: { ...request.scope, summary: "\uFFFD" },
+      }).success,
+    ).toBe(true);
   });
 
   it("recognizes only paths inside the allowed root", () => {

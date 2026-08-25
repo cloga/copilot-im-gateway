@@ -73,6 +73,14 @@ their audit records. Durable sequence numbers prevent retrying work from being
 overtaken after restart. Terminal inbox metadata and audit data default to
 14-day and 30-day retention respectively.
 
+Admission reservations carry the owning daemon generation. A replacement daemon
+rechecks sender, personal binding, durable rate, and capacity policy before it
+reclaims the original sequence. A duplicate still being materialized by the
+live owner is retryable, while abandoned reservation barriers expire explicitly
+so later FIFO work cannot remain blocked forever. Rejections use a separate
+bounded aggregate ring (256 route/sender/reason buckets retained for seven days
+by default); rejected message IDs and bodies are not stored.
+
 Transient extension failures use capped durable retries. The bridge is
 necessarily at-least-once across the boundary where `sendAndWait()` may succeed
 but the completion acknowledgement is lost; prompts and tools should therefore
@@ -85,6 +93,24 @@ The project extension is discovered from
 foreground session, polls the daemon while alive, and stops on session shutdown
 or process termination. No credential or conversation state is kept only in the
 extension process.
+
+## API compatibility
+
+The extension performs an authenticated `GET /v2/status` handshake before any
+lease, completion, outbound, binding, or approval operation. The response pins
+API version 2 and the account-routing, sender-binding, operation-approval, and
+reservation-ownership capabilities. All current extension and Canvas operations
+use `/v2`.
+
+`/v1/status`, audit, login, and workspace-alias operations remain available for
+safe diagnostics and setup. Legacy operations whose payload lacks the negotiated
+account or sender fail with HTTP 426 and `UPGRADE_REQUIRED`; they are never
+silently interpreted as v2. A new extension maps a missing or incomplete v2
+handshake to `DAEMON_UPGRADE_REQUIRED` before sending an unsafe request.
+
+Release archives and the Windows installer carry the compiled daemon and the
+complete extension directory in one validated package. Upgrade those artifacts
+together rather than copying an extension or daemon independently.
 
 ## Governance invariants
 

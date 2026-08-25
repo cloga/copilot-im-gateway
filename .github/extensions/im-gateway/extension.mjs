@@ -49,6 +49,7 @@ const joinedSession = await joinSession({
   onPermissionRequest,
 });
 session = joinedSession;
+await client.ensureCompatible();
 
 await joinedSession.log(
   `IM Gateway connected to ${connection.baseUrl}. Open the IM Gateway canvas to configure it.`,

@@ -41,8 +41,11 @@ scope.
 
 Inbound authorization uses only a minimal identity envelope. Rejected bodies and
 attachments are never materialized or persisted, and denial audits contain only
-labeled identity hashes. Terminal inbox metadata is retained for 14 days and
-audit metadata for 30 days by default.
+labeled identity hashes. Rejection counts are aggregated by hashed
+route/sender/reason in a hard-capped 256-slot store with immediate seven-day
+cleanup, independent of inbox and audit retention. Unique unauthorized message
+IDs therefore cannot grow SQLite state. Terminal inbox metadata is retained for
+14 days and audit metadata for 30 days by default.
 
 ## Explicit non-goals
 

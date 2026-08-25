@@ -3,8 +3,8 @@
 1. Start the daemon with a fresh personal data directory.
 2. Load the project extension in GitHub Copilot App.
 3. Open the **IM Gateway** Canvas and verify daemon health is `ready`.
-4. Copy the negotiated bot account ID from channel status and add it with your
-   personal WeChat sender ID to the allowlist.
+4. Verify channel status shows the non-secret account ID/user ID and ready
+   account label, and that the allowlist/binding forms prefill those identities.
 5. Map a non-work test repository to a short workspace alias.
 6. Start WeChat login, scan the QR code, and enter a pairing code if requested.
 7. Bind the bot account, conversation, and sender owner to the current Copilot
