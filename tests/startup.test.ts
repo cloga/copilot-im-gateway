@@ -10,6 +10,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { canonicalizeIdentityComponents } from "../src/core/contracts.js";
 import type {
   ChannelHealth,
   ImChannelAdapter,
@@ -28,6 +29,24 @@ import {
 } from "../src/daemon/store.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
+
+function shutdownProof(
+  token: string,
+  purpose: "identity-request" | "identity-response",
+  values: readonly string[],
+): string {
+  return createHmac("sha256", token)
+    .update(
+      canonicalizeIdentityComponents([
+        "copilot-im-gateway-shutdown",
+        "1",
+        purpose,
+        ...values,
+      ]),
+      "utf8",
+    )
+    .digest("hex");
+}
 
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) {
@@ -426,30 +445,86 @@ describe("gateway startup", () => {
       },
     });
 
-    const challenge = "a".repeat(64);
-    const requestProof = createHmac("sha256", token)
-      .update(`request\0${challenge}`, "utf8")
-      .digest("hex");
+    const clientNonce = "a".repeat(64);
+    const owner = {
+      pid: process.pid,
+      creationMarker: "133713371337000000",
+      executablePath: process.execPath,
+      entrypoint: path.resolve("dist", "daemon", "main.js"),
+    };
+    const requestProof = shutdownProof(token, "identity-request", [
+      String(owner.pid),
+      owner.creationMarker,
+      String(port),
+      clientNonce,
+      owner.executablePath,
+      owner.entrypoint,
+    ]);
     const identityResponse = await fetch(
       `${runtime.running.url}/v2/admin/identity`,
       {
+        method: "POST",
         headers: {
-          "X-Gateway-Shutdown-Challenge": challenge,
-          "X-Gateway-Shutdown-Proof": requestProof,
+          Connection: "close",
+          "Content-Type": "application/json",
         },
+        body: JSON.stringify({
+          protocolVersion: 1,
+          owner,
+          port,
+          clientNonce,
+          requestProof,
+        }),
       },
     );
     expect(identityResponse.status).toBe(200);
-    await expect(identityResponse.json()).resolves.toMatchObject({
+    const identity = (await identityResponse.json()) as {
+      protocolVersion: 1;
+      apiVersion: number;
+      instanceId: string;
+      challengeId: string;
+      owner: typeof owner;
+      port: number;
+      clientNonce: string;
+      expiresAt: number;
+      responseProof: string;
+    };
+    expect(identity).toMatchObject({
+      protocolVersion: 1,
       apiVersion: 2,
-      proof: createHmac("sha256", token)
-        .update(`response\0${challenge}`, "utf8")
-        .digest("hex"),
+      owner,
+      port,
+      clientNonce,
     });
+    expect(identity.responseProof).toBe(
+      shutdownProof(token, "identity-response", [
+        String(identity.apiVersion),
+        identity.instanceId,
+        identity.challengeId,
+        String(owner.pid),
+        owner.creationMarker,
+        String(port),
+        clientNonce,
+        String(identity.expiresAt),
+        owner.executablePath,
+        owner.entrypoint,
+      ]),
+    );
 
     const response = await fetch(`${runtime.running.url}/v2/admin/shutdown`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${token}` },
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Connection: "close",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        protocolVersion: 1,
+        instanceId: identity.instanceId,
+        challengeId: identity.challengeId,
+        clientNonce: identity.clientNonce,
+        responseProof: identity.responseProof,
+      }),
     });
     expect(response.status).toBe(202);
     await shutdownCompleted;

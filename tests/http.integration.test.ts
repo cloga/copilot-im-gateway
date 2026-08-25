@@ -1,7 +1,9 @@
 import { mkdtempSync, rmSync } from "node:fs";
+import { createHmac } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { canonicalizeIdentityComponents } from "../src/core/contracts.js";
 import type {
   ChannelContext,
   ChannelHealth,
@@ -53,6 +55,10 @@ afterEach(async () => {
 
 async function createHarness(
   onShutdown?: () => Promise<void> | void,
+  shutdownProtocolDependencies?: {
+    now?: () => number;
+    createId?: () => string;
+  },
 ): Promise<{
   baseUrl: string;
   token: string;
@@ -71,6 +77,9 @@ async function createHarness(
     bearerToken: token,
     port: 0,
     ...(onShutdown === undefined ? {} : { onShutdown }),
+    ...(shutdownProtocolDependencies === undefined
+      ? {}
+      : { shutdownProtocolDependencies }),
   });
   cleanups.push(async () => {
     await closeHarness(running, service, store);
@@ -105,23 +114,153 @@ async function request(
   });
 }
 
+interface ShutdownOwner {
+  pid: number;
+  creationMarker: string;
+  executablePath: string;
+  entrypoint: string;
+}
+
+interface ShutdownIdentity {
+  protocolVersion: 1;
+  apiVersion: number;
+  capabilities: string[];
+  instanceId: string;
+  challengeId: string;
+  owner: ShutdownOwner;
+  port: number;
+  clientNonce: string;
+  expiresAt: number;
+  responseProof: string;
+}
+
+function shutdownProof(
+  token: string,
+  purpose: "identity-request" | "identity-response",
+  values: readonly string[],
+): string {
+  return createHmac("sha256", token)
+    .update(
+      canonicalizeIdentityComponents([
+        "copilot-im-gateway-shutdown",
+        "1",
+        purpose,
+        ...values,
+      ]),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+function shutdownOwner(): ShutdownOwner {
+  return {
+    pid: process.pid,
+    creationMarker: "133713371337000000",
+    executablePath: process.execPath,
+    entrypoint: path.resolve("dist", "daemon", "main.js"),
+  };
+}
+
+async function requestShutdownIdentity(options: {
+  baseUrl: string;
+  token: string;
+  clientNonce?: string;
+  owner?: ShutdownOwner;
+  port?: number;
+}): Promise<{ requestBody: object; response: Response }> {
+  const owner = options.owner ?? shutdownOwner();
+  const port = options.port ?? Number(new URL(options.baseUrl).port);
+  const clientNonce = options.clientNonce ?? "a".repeat(64);
+  const requestProof = shutdownProof(options.token, "identity-request", [
+    String(owner.pid),
+    owner.creationMarker,
+    String(port),
+    clientNonce,
+    owner.executablePath,
+    owner.entrypoint,
+  ]);
+  const requestBody = {
+    protocolVersion: 1,
+    owner,
+    port,
+    clientNonce,
+    requestProof,
+  };
+  return {
+    requestBody,
+    response: await request(
+      options.baseUrl,
+      undefined,
+      "/v2/admin/identity",
+      {
+        method: "POST",
+        body: JSON.stringify(requestBody),
+      },
+    ),
+  };
+}
+
+function shutdownCredentials(identity: ShutdownIdentity): object {
+  return {
+    protocolVersion: identity.protocolVersion,
+    instanceId: identity.instanceId,
+    challengeId: identity.challengeId,
+    clientNonce: identity.clientNonce,
+    responseProof: identity.responseProof,
+  };
+}
+
 describe("gateway HTTP API", () => {
-  it("authenticates and schedules administrative shutdown exactly once", async () => {
+  it("binds and consumes an authenticated shutdown challenge exactly once", async () => {
+    let now = Date.parse("2026-08-25T00:00:00.000Z");
     let callbackCalls = 0;
     let observeShutdown: () => void = () => undefined;
     const shutdownObserved = new Promise<void>((resolve) => {
       observeShutdown = resolve;
     });
-    const harness = await createHarness(() => {
-      callbackCalls += 1;
-      observeShutdown();
+    const harness = await createHarness(
+      () => {
+        callbackCalls += 1;
+        observeShutdown();
+      },
+      { now: () => now },
+    );
+    const identityResponse = await requestShutdownIdentity(harness);
+    expect(identityResponse.response.status).toBe(200);
+    const identity = (await identityResponse.response.json()) as ShutdownIdentity;
+    expect(identity).toMatchObject({
+      protocolVersion: 1,
+      apiVersion: 2,
+      capabilities: expect.arrayContaining(["reservation-ownership"]),
+      owner: shutdownOwner(),
+      port: Number(new URL(harness.baseUrl).port),
+      clientNonce: "a".repeat(64),
+      expiresAt: expect.any(Number),
+      instanceId: expect.any(String),
+      challengeId: expect.any(String),
+      responseProof: expect.any(String),
     });
+    expect(identity.responseProof).toBe(
+      shutdownProof(harness.token, "identity-response", [
+        String(identity.apiVersion),
+        identity.instanceId,
+        identity.challengeId,
+        String(identity.owner.pid),
+        identity.owner.creationMarker,
+        String(identity.port),
+        identity.clientNonce,
+        String(identity.expiresAt),
+        identity.owner.executablePath,
+        identity.owner.entrypoint,
+      ]),
+    );
+    const credentials = shutdownCredentials(identity);
 
     const unauthenticated = await request(
       harness.baseUrl,
       undefined,
       "/v2/admin/shutdown",
-      { method: "POST" },
+      { method: "POST", body: JSON.stringify(credentials) },
     );
     expect(unauthenticated.status).toBe(401);
     expect(callbackCalls).toBe(0);
@@ -139,23 +278,181 @@ describe("gateway HTTP API", () => {
       harness.baseUrl,
       harness.token,
       "/v2/admin/shutdown",
-      { method: "POST" },
+      { method: "POST", body: JSON.stringify(credentials) },
     );
     expect(accepted.status).toBe(202);
     expect(await accepted.json()).toEqual({ accepted: true });
     await shutdownObserved;
 
+    now += 10_000;
     const repeated = await request(
       harness.baseUrl,
       harness.token,
       "/v2/admin/shutdown",
-      { method: "POST" },
+      { method: "POST", body: JSON.stringify(credentials) },
     );
-    expect(repeated.status).toBe(202);
+    expect(repeated.status).toBe(409);
+    expect(await repeated.json()).toMatchObject({
+      error: { code: "SHUTDOWN_CHALLENGE_ALREADY_CONSUMED" },
+    });
     await new Promise<void>((resolve) => {
       setImmediate(resolve);
     });
     expect(callbackCalls).toBe(1);
+  });
+
+  it("rejects forged, stale, duplicate, and cross-instance shutdown identity", async () => {
+    let secondShutdownCalls = 0;
+    const first = await createHarness();
+    const second = await createHarness(() => {
+      secondShutdownCalls += 1;
+    });
+    const firstOwner = shutdownOwner();
+
+    const forgedProof = await requestShutdownIdentity({
+      baseUrl: first.baseUrl,
+      token: "wrong-token-with-at-least-thirty-two-characters",
+      clientNonce: "b".repeat(64),
+    });
+    expect(forgedProof.response.status).toBe(401);
+
+    const wrongPid = await requestShutdownIdentity({
+      ...first,
+      owner: { ...firstOwner, pid: process.pid + 1 },
+      clientNonce: "e".repeat(64),
+    });
+    expect(wrongPid.response.status).toBe(401);
+
+    const valid = await requestShutdownIdentity({
+      ...first,
+      clientNonce: "c".repeat(64),
+    });
+    expect(valid.response.status).toBe(200);
+    const identity = (await valid.response.json()) as ShutdownIdentity;
+
+    const duplicate = await request(
+      first.baseUrl,
+      undefined,
+      "/v2/admin/identity",
+      {
+        method: "POST",
+        body: JSON.stringify(valid.requestBody),
+      },
+    );
+    expect(duplicate.status).toBe(409);
+    expect(await duplicate.json()).toMatchObject({
+      error: { code: "SHUTDOWN_CHALLENGE_ALREADY_CONSUMED" },
+    });
+
+    const crossInstance = await request(
+      second.baseUrl,
+      second.token,
+      "/v2/admin/shutdown",
+      {
+        method: "POST",
+        body: JSON.stringify(shutdownCredentials(identity)),
+      },
+    );
+    expect(crossInstance.status).toBe(401);
+    expect(await crossInstance.json()).toMatchObject({
+      error: { code: "SHUTDOWN_CHALLENGE_INVALID" },
+    });
+    expect(secondShutdownCalls).toBe(0);
+  });
+
+  it("expires shutdown challenges without scheduling shutdown", async () => {
+    let now = Date.parse("2026-08-25T00:00:00.000Z");
+    let shutdownCalls = 0;
+    const ids = [
+      "11111111-1111-4111-8111-111111111111",
+      "22222222-2222-4222-8222-222222222222",
+    ];
+    const harness = await createHarness(
+      () => {
+        shutdownCalls += 1;
+      },
+      {
+        now: () => now,
+        createId: () => ids.shift() ?? "33333333-3333-4333-8333-333333333333",
+      },
+    );
+    const issued = await requestShutdownIdentity({
+      ...harness,
+      clientNonce: "d".repeat(64),
+    });
+    const identity = (await issued.response.json()) as ShutdownIdentity;
+    expect(identity.expiresAt).toBe(Date.parse("2026-08-25T00:00:10.000Z"));
+
+    now += 10_000;
+    const expired = await request(
+      harness.baseUrl,
+      harness.token,
+      "/v2/admin/shutdown",
+      {
+        method: "POST",
+        body: JSON.stringify(shutdownCredentials(identity)),
+      },
+    );
+    expect(expired.status).toBe(409);
+    expect(await expired.json()).toMatchObject({
+      error: { code: "SHUTDOWN_CHALLENGE_EXPIRED" },
+    });
+
+    const replayedIdentity = await request(
+      harness.baseUrl,
+      undefined,
+      "/v2/admin/identity",
+      {
+        method: "POST",
+        body: JSON.stringify(issued.requestBody),
+      },
+    );
+    expect(replayedIdentity.status).toBe(409);
+    expect(await replayedIdentity.json()).toMatchObject({
+      error: { code: "SHUTDOWN_CHALLENGE_ALREADY_CONSUMED" },
+    });
+    expect(shutdownCalls).toBe(0);
+  });
+
+  it("preserves replay tombstones and fails closed at shutdown challenge capacity", async () => {
+    const harness = await createHarness(undefined, {
+      now: () => Date.parse("2026-08-25T00:00:00.000Z"),
+    });
+    const issuedRequests: object[] = [];
+    for (let index = 1; index <= 64; index += 1) {
+      const issued = await requestShutdownIdentity({
+        ...harness,
+        clientNonce: index.toString(16).padStart(64, "0"),
+      });
+      expect(issued.response.status).toBe(200);
+      issuedRequests.push(issued.requestBody);
+    }
+
+    const replay = await request(
+      harness.baseUrl,
+      undefined,
+      "/v2/admin/identity",
+      {
+        method: "POST",
+        body: JSON.stringify(issuedRequests[0]),
+      },
+    );
+    expect(replay.status).toBe(409);
+    expect(await replay.json()).toMatchObject({
+      error: { code: "SHUTDOWN_CHALLENGE_ALREADY_CONSUMED" },
+    });
+
+    const capacity = await requestShutdownIdentity({
+      ...harness,
+      clientNonce: "65".padStart(64, "0"),
+    });
+    expect(capacity.response.status).toBe(503);
+    expect(await capacity.response.json()).toMatchObject({
+      error: {
+        code: "SHUTDOWN_CHALLENGE_CAPACITY_EXCEEDED",
+        retryable: true,
+      },
+    });
   });
 
   it("requires authentication and enforces personal workspace bindings", async () => {

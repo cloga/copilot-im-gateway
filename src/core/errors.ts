@@ -17,6 +17,10 @@ export const gatewayErrorCodes = {
   notFound: "NOT_FOUND",
   rateLimited: "RATE_LIMITED",
   senderDenied: "SENDER_NOT_ALLOWED",
+  shutdownChallengeCapacityExceeded: "SHUTDOWN_CHALLENGE_CAPACITY_EXCEEDED",
+  shutdownChallengeExpired: "SHUTDOWN_CHALLENGE_EXPIRED",
+  shutdownChallengeInvalid: "SHUTDOWN_CHALLENGE_INVALID",
+  shutdownChallengeReplayed: "SHUTDOWN_CHALLENGE_ALREADY_CONSUMED",
   upgradeRequired: "UPGRADE_REQUIRED",
   workspaceDenied: "WORKSPACE_NOT_ALLOWED",
 } as const;

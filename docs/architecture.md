@@ -115,15 +115,33 @@ handshake to `DAEMON_UPGRADE_REQUIRED` before sending an unsafe request.
 
 Release archives and the Windows installer carry the compiled daemon, its
 validated recursive ESM closure manifest, and the complete extension directory
-in one package. Installer upgrades send an authenticated, empty-body
-`POST /v2/admin/shutdown`; the daemon acknowledges before asynchronously closing
-the listener, settling every channel stop, and releasing SQLite ownership.
-Upgrades wait for the process and loopback port to exit. There is no process-kill
-fallback: a legacy daemon or unknown listener that cannot accept authenticated
-v2 shutdown aborts the upgrade before installed files or data are changed. The
-user must exit the old Copilot IM Gateway and retry. Startup binding remains the
-final fail-closed migration guard. Upgrade those artifacts together rather than
-copying an extension or daemon independently.
+in one package. Before an automatic upgrade shutdown, the Windows guard resolves
+the single `127.0.0.1:<port>` Listen socket to its CIM process record and requires
+that process to be the sole tokenized Node invocation of the exact installed
+daemon entrypoint. It records the PID, Windows creation marker, executable, and
+entrypoint before requesting identity. For shutdown it first opens one
+credential-free TCP connection, then resolves and compares the same tuple while
+that socket is already established.
+
+Identity uses a bearer-token HMAC request rather than disclosing the bearer. The
+daemon returns a ten-second, process/port/instance-bound challenge whose response
+proof also binds the client nonce, observed Windows creation marker, executable,
+entrypoint, and expiry. The installer verifies every bound field, then sends the
+challenge and bearer to `POST /v2/admin/shutdown` over that same non-reconnecting
+socket. The daemon atomically consumes the in-memory challenge before
+acknowledging and asynchronously closes the listener, settles every channel
+stop, and releases SQLite ownership. Expired and consumed challenges remain
+replay tombstones for five minutes; the bounded registry rejects new issuance
+with a retryable capacity error rather than evicting a tombstone. Challenges do
+not survive process restart.
+
+Upgrades wait for the captured process and loopback port to exit. There is no
+process-kill fallback: an ambiguous process set, wildcard/public or IPv6
+listener, owner switch, legacy daemon, or unknown listener aborts the upgrade
+before installed files or data are changed. The user must exit the old Copilot
+IM Gateway and retry. Startup binding remains the final fail-closed migration
+guard. Upgrade those artifacts together rather than copying an extension or
+daemon independently.
 
 ## Governance invariants
 

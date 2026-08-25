@@ -3,7 +3,7 @@ import {
   spawn,
   spawnSync,
 } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, createHmac } from "node:crypto";
 import {
   mkdir,
   mkdtemp,
@@ -618,12 +618,26 @@ describe("release packaging", () => {
       ),
     );
     expect(stopDaemonScript).toContain("Get-CimInstance Win32_Process");
+    expect(stopDaemonScript).toContain("Get-NetTCPConnection");
+    expect(stopDaemonScript).toContain("OwningProcess");
+    expect(stopDaemonScript).toContain("CreationMarker");
     expect(stopDaemonScript).toContain("CommandLineToArgvW");
     expect(stopDaemonScript).toContain("Test-GatewayProcess");
+    expect(stopDaemonScript).toContain("Get-ValidatedGatewayListenerOwner");
+    expect(stopDaemonScript).toContain("Test-GatewayProcessRecord");
     expect(stopDaemonScript).toContain("/v2/admin/shutdown");
     expect(stopDaemonScript).toContain("/v2/admin/identity");
     expect(stopDaemonScript).toContain("Get-HmacSha256Hex");
-    expect(stopDaemonScript).toContain('Authorization = "Bearer $BearerToken"');
+    expect(stopDaemonScript).toContain("clientNonce");
+    expect(stopDaemonScript).toContain("responseProof");
+    expect(stopDaemonScript).toContain("[Net.Sockets.TcpClient]::new()");
+    expect(stopDaemonScript).toContain("Connection: close");
+    expect(stopDaemonScript).toContain(
+      "[Text.Encoding]::UTF8.GetBytes($requestBody)",
+    );
+    expect(stopDaemonScript).toContain(
+      'ContentType "application/json; charset=utf-8"',
+    );
     expect(stopDaemonScript).toContain(
       "Exit the old Copilot IM Gateway and retry.",
     );
@@ -636,7 +650,6 @@ describe("release packaging", () => {
       ].join("\n"),
     ).not.toContain("Stop-Process");
     expect(stopDaemonScript).not.toContain("Wait-Process");
-    expect(stopDaemonScript).not.toContain("Get-NetTCPConnection");
     expect(stopDaemonScript).not.toContain("FallbackLeaseWaitSeconds");
     expect(stopDaemonScript).not.toContain("Get-RevalidatedGatewayProcess");
     expect(stopDaemonScript).not.toContain("$commandLine.IndexOf");
@@ -918,6 +931,191 @@ describe("release packaging", () => {
   );
 
   it.skipIf(process.platform !== "win32")(
+    "rejects bearer tokens that could inject an HTTP header",
+    async () => {
+      const root = await mkdtemp(
+        path.join(os.tmpdir(), "copilot-im-gateway-token-format-"),
+      );
+      try {
+        const installDirectory = path.join(root, "install");
+        const dataDirectory = path.join(root, "data");
+        const tokenFile = path.join(dataDirectory, "auth-token");
+        const identityMarker = path.join(root, "identity-requested");
+        await Promise.all([
+          mkdir(installDirectory, { recursive: true }),
+          mkdir(dataDirectory, { recursive: true }),
+        ]);
+        await writeFile(
+          tokenFile,
+          `${"a".repeat(32)}\r\nInjected: value`,
+          "utf8",
+        );
+        const stopScript = path.resolve(
+          import.meta.dirname,
+          "..",
+          "scripts",
+          "release",
+          "stop-daemon.ps1",
+        );
+        const quote = (value: string) => value.replaceAll("'", "''");
+        const command = [
+          `. '${quote(stopScript)}' -InstallDirectory '${quote(installDirectory)}'`,
+          `$entrypoint = [IO.Path]::GetFullPath((Join-Path '${quote(installDirectory)}' 'app\\dist\\daemon\\main.js'))`,
+          "$owner = [pscustomobject]@{ ProcessId = 1001; CreationMarker = '133713371337000001'; ExecutablePath = 'C:\\runtime\\node.exe'; Entrypoint = $entrypoint }",
+          "function Test-LoopbackPortAvailable { param([int]$Port) return $false }",
+          "function Get-ValidatedGatewayListenerOwner { param([int]$Port, [string[]]$Entrypoints) return $owner }",
+          `function Request-AuthenticatedGatewayIdentity { param([int]$Port, [string]$BearerToken, [object]$Owner) Set-Content -LiteralPath '${quote(identityMarker)}' -Value 'called'; throw 'Identity must not be requested.' }`,
+          "$blocked = $false",
+          `try { Invoke-StopGatewayDaemon -InstallDirectory '${quote(installDirectory)}' -DataDirectory '${quote(dataDirectory)}' -TokenFile '${quote(tokenFile)}' -Port 32147 -TimeoutSeconds 1 } catch { if ($_.Exception.Message -notlike '*token file is invalid*') { throw }; $blocked = $true }`,
+          "if (-not $blocked) { throw 'Header-injecting token was accepted.' }",
+          `if (Test-Path -LiteralPath '${quote(identityMarker)}') { throw 'Identity was requested with an invalid token.' }`,
+        ].join("; ");
+        const result = spawnSync(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+          ],
+          { encoding: "utf8", timeout: 15_000, windowsHide: true },
+        );
+        expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+        await expect(readFile(identityMarker, "utf8")).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } finally {
+        await rm(root, { force: true, recursive: true });
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "does not contact a listener when multiple exact installed daemons run",
+    async () => {
+      const root = await mkdtemp(
+        path.join(os.tmpdir(), "copilot-im-gateway-ambiguous-owner-"),
+      );
+      const installDirectory = path.join(root, "install");
+      const dataDirectory = path.join(root, "data");
+      const entrypoint = path.join(
+        installDirectory,
+        "app",
+        "dist",
+        "daemon",
+        "main.js",
+      );
+      const tokenFile = path.join(dataDirectory, "auth-token");
+      const readyA = path.join(root, "ready-a");
+      const readyB = path.join(root, "ready-b");
+      const requestB = path.join(root, "request-b");
+      let daemonA: ChildProcess | undefined;
+      let daemonB: ChildProcess | undefined;
+      try {
+        await Promise.all([
+          mkdir(path.dirname(entrypoint), { recursive: true }),
+          mkdir(dataDirectory, { recursive: true }),
+        ]);
+        await Promise.all([
+          writeFile(
+            entrypoint,
+            [
+              'const http = require("node:http");',
+              'const fs = require("node:fs");',
+              "const port = Number(process.argv[2]);",
+              "const ready = process.argv[3];",
+              "const received = process.argv[4];",
+              "const server = http.createServer((_request, response) => {",
+              '  fs.writeFileSync(received, "received");',
+              "  response.writeHead(500);",
+              '  response.end("unexpected");',
+              "});",
+              'server.listen(port, "127.0.0.1", () => {',
+              '  fs.writeFileSync(ready, "ready");',
+              "});",
+              "",
+            ].join("\n"),
+            "utf8",
+          ),
+          writeFile(tokenFile, `${"a".repeat(64)}\n`, "utf8"),
+        ]);
+        const portA = await availablePort();
+        daemonA = spawn(
+          process.execPath,
+          [entrypoint, String(portA), readyA, path.join(root, "request-a")],
+          { stdio: "ignore", windowsHide: true },
+        );
+        await waitForFile(readyA);
+        const portB = await availablePort();
+        daemonB = spawn(
+          process.execPath,
+          [entrypoint, String(portB), readyB, requestB],
+          { stdio: "ignore", windowsHide: true },
+        );
+        await waitForFile(readyB);
+
+        const stopScript = path.resolve(
+          import.meta.dirname,
+          "..",
+          "scripts",
+          "release",
+          "stop-daemon.ps1",
+        );
+        const blocked = spawnSync(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            stopScript,
+            "-InstallDirectory",
+            installDirectory,
+            "-DataDirectory",
+            dataDirectory,
+            "-TokenFile",
+            tokenFile,
+            "-Port",
+            String(portB),
+            "-TimeoutSeconds",
+            "2",
+          ],
+          {
+            encoding: "utf8",
+            timeout: 15_000,
+            windowsHide: true,
+          },
+        );
+        expect(
+          blocked.status,
+          `${blocked.stdout}\n${blocked.stderr}`,
+        ).not.toBe(0);
+        expect(`${blocked.stdout}\n${blocked.stderr}`).toContain(
+          "Expected one exact installed gateway process",
+        );
+        expect(daemonA.exitCode).toBeNull();
+        expect(daemonB.exitCode).toBeNull();
+        await expect(readFile(requestB, "utf8")).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } finally {
+        if (daemonB !== undefined) {
+          await stopTestProcess(daemonB);
+        }
+        if (daemonA !== undefined) {
+          await stopTestProcess(daemonA);
+        }
+        await rm(root, { force: true, recursive: true });
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform !== "win32")(
     "selects only an exact tokenized Node daemon entrypoint",
     () => {
       const root = path.resolve(import.meta.dirname, "..");
@@ -958,5 +1156,328 @@ describe("release packaging", () => {
       );
       expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
     },
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "encodes Unicode shutdown identity JSON and HMAC as UTF-8 on PowerShell 5.1",
+    async () => {
+      const root = await mkdtemp(
+        path.join(os.tmpdir(), "copilot-im-gateway-unicode-identity-"),
+      );
+      try {
+        const installDirectory = path.join(root, "安装 网关");
+        const executablePath = path.join(root, "运行时", "节点.exe");
+        const entrypoint = path.join(
+          installDirectory,
+          "应用",
+          "dist",
+          "daemon",
+          "main.js",
+        );
+        const capturedBody = path.join(root, "identity-body.json");
+        const stopScript = path.resolve(
+          import.meta.dirname,
+          "..",
+          "scripts",
+          "release",
+          "stop-daemon.ps1",
+        );
+        const quote = (value: string) => value.replaceAll("'", "''");
+        const token = "a".repeat(64);
+        const nonce = "d".repeat(64);
+        const command = [
+          `. '${quote(stopScript)}' -InstallDirectory '${quote(installDirectory)}'`,
+          `$owner = [pscustomobject]@{ ProcessId = 1001; CreationMarker = '133713371337000001'; ExecutablePath = '${quote(executablePath)}'; Entrypoint = '${quote(entrypoint)}' }`,
+          `function New-GatewayShutdownNonce { return '${nonce}' }`,
+          `function Invoke-WebRequest { param([string]$Uri, [string]$Method, [string]$ContentType, [object]$Body, [int]$TimeoutSec, [switch]$UseBasicParsing) if ($ContentType -cne 'application/json; charset=utf-8') { throw 'Unexpected identity content type.' }; if ($Body -isnot [byte[]]) { throw 'Identity body was not a byte array.' }; [IO.File]::WriteAllBytes('${quote(capturedBody)}', [byte[]]$Body); throw 'Captured identity request.' }`,
+          `$identity = Request-AuthenticatedGatewayIdentity -Port 32147 -BearerToken '${token}' -Owner $owner`,
+          "if ($null -ne $identity) { throw 'Capture-only identity request unexpectedly succeeded.' }",
+        ].join("; ");
+        const result = spawnSync(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+          ],
+          { encoding: "utf8", timeout: 15_000, windowsHide: true },
+        );
+        expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+
+        const bodyBytes = await readFile(capturedBody);
+        const bodyText = bodyBytes.toString("utf8");
+        expect(Buffer.from(bodyText, "utf8")).toEqual(bodyBytes);
+        expect(bodyBytes.length).toBeGreaterThan(bodyText.length);
+        const payload = JSON.parse(bodyText) as {
+          protocolVersion: number;
+          owner: {
+            pid: number;
+            creationMarker: string;
+            executablePath: string;
+            entrypoint: string;
+          };
+          port: number;
+          clientNonce: string;
+          requestProof: string;
+        };
+        expect(payload).toMatchObject({
+          protocolVersion: 1,
+          owner: {
+            pid: 1001,
+            creationMarker: "133713371337000001",
+            executablePath,
+            entrypoint,
+          },
+          port: 32147,
+          clientNonce: nonce,
+        });
+        const components = [
+          "copilot-im-gateway-shutdown",
+          "1",
+          "identity-request",
+          "1001",
+          payload.owner.creationMarker,
+          "32147",
+          nonce,
+          executablePath,
+          entrypoint,
+        ];
+        const proofPayload = components
+          .map((value) => `${Buffer.byteLength(value, "utf8")}:${value}`)
+          .join("");
+        expect(payload.requestProof).toBe(
+          createHmac("sha256", token).update(proofPayload, "utf8").digest("hex"),
+        );
+      } finally {
+        await rm(root, { force: true, recursive: true });
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "maps the exact IPv4 loopback listener to its owning gateway process",
+    async () => {
+      const root = await mkdtemp(
+        path.join(os.tmpdir(), "copilot-im-gateway-owner-map-"),
+      );
+      const installDirectory = path.join(root, "install");
+      const entrypoint = path.join(
+        installDirectory,
+        "app",
+        "dist",
+        "daemon",
+        "main.js",
+      );
+      const readyFile = path.join(root, "ready");
+      let listener: ChildProcess | undefined;
+      try {
+        await mkdir(path.dirname(entrypoint), { recursive: true });
+        await writeFile(
+          entrypoint,
+          [
+            'const net = require("node:net");',
+            'const fs = require("node:fs");',
+            "const port = Number(process.argv[2]);",
+            "const ready = process.argv[3];",
+            "const server = net.createServer();",
+            'server.listen(port, "127.0.0.1", () => {',
+            '  fs.writeFileSync(ready, "ready");',
+            "});",
+            "",
+          ].join("\n"),
+          "utf8",
+        );
+        const port = await availablePort();
+        listener = spawn(
+          process.execPath,
+          [entrypoint, String(port), readyFile],
+          { stdio: "ignore", windowsHide: true },
+        );
+        await waitForFile(readyFile);
+
+        const stopScript = path.resolve(
+          import.meta.dirname,
+          "..",
+          "scripts",
+          "release",
+          "stop-daemon.ps1",
+        );
+        const quote = (value: string) => value.replaceAll("'", "''");
+        const command = [
+          `. '${quote(stopScript)}' -InstallDirectory '${quote(installDirectory)}'`,
+          `$entrypoints = @([IO.Path]::GetFullPath('${quote(entrypoint)}'))`,
+          `$owner = Get-ValidatedGatewayListenerOwner -Port ${port} -Entrypoints $entrypoints`,
+          "$owner | ConvertTo-Json -Compress",
+        ].join("; ");
+        const result = spawnSync(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+          ],
+          { encoding: "utf8", timeout: 15_000, windowsHide: true },
+        );
+        expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+        const owner = JSON.parse(result.stdout.trim()) as {
+          ProcessId: number;
+          CreationMarker: string;
+          ExecutablePath: string;
+          Entrypoint: string;
+        };
+        expect(owner.ProcessId).toBe(listener.pid);
+        expect(owner.CreationMarker).toMatch(/^[0-9]{1,20}$/u);
+        expect(owner.ExecutablePath.toLowerCase()).toBe(
+          process.execPath.toLowerCase(),
+        );
+        expect(owner.Entrypoint.toLowerCase()).toBe(entrypoint.toLowerCase());
+      } finally {
+        if (listener !== undefined) {
+          await stopTestProcess(listener);
+        }
+        await rm(root, { force: true, recursive: true });
+      }
+    },
+    30_000,
+  );
+
+  it.skipIf(process.platform !== "win32")(
+    "connects before owner revalidation and never sends shutdown to a replacement listener",
+    async () => {
+      const root = await mkdtemp(
+        path.join(os.tmpdir(), "copilot-im-gateway-owner-switch-"),
+      );
+      const listenerScript = path.join(root, "listener-race.cjs");
+      const readyFile = path.join(root, "ready");
+      const connectedFile = path.join(root, "connected");
+      const replaceSignal = path.join(root, "replace");
+      const replacementReady = path.join(root, "replacement-ready");
+      const originalRequest = path.join(root, "original-request");
+      const replacementRequest = path.join(root, "replacement-request");
+      let listener: ChildProcess | undefined;
+      try {
+        const installDirectory = path.join(root, "install");
+        await mkdir(installDirectory, { recursive: true });
+        await writeFile(
+          listenerScript,
+          [
+            'const fs = require("node:fs");',
+            'const net = require("node:net");',
+            "const port = Number(process.argv[2]);",
+            "const readyFile = process.argv[3];",
+            "const connectedFile = process.argv[4];",
+            "const replaceSignal = process.argv[5];",
+            "const replacementReady = process.argv[6];",
+            "const originalRequest = process.argv[7];",
+            "const replacementRequest = process.argv[8];",
+            "let replacing = false;",
+            "const replacement = net.createServer((socket) => {",
+            '  fs.writeFileSync(replacementRequest, "connected");',
+            "  socket.destroy();",
+            "});",
+            "const original = net.createServer((socket) => {",
+            '  fs.writeFileSync(connectedFile, "connected");',
+            "  let request = Buffer.alloc(0);",
+            '  socket.on("data", (chunk) => {',
+            "    request = Buffer.concat([request, chunk]);",
+            '    const headerEnd = request.indexOf("\\r\\n\\r\\n");',
+            "    if (headerEnd < 0) return;",
+            "    const headers = request.subarray(0, headerEnd + 4).toString(\"ascii\");",
+            '    const match = /\\r\\nContent-Length: ([0-9]+)\\r\\n/i.exec(headers);',
+            "    if (match === null) return;",
+            "    const bodyLength = Number(match[1]);",
+            "    if (request.length < headerEnd + 4 + bodyLength) return;",
+            "    fs.writeFileSync(originalRequest, request);",
+            '    socket.end("HTTP/1.1 202 Accepted\\r\\nContent-Length: 17\\r\\nConnection: close\\r\\n\\r\\n{\\"accepted\\":true}");',
+            "  });",
+            "});",
+            "const timer = setInterval(() => {",
+            "  if (replacing || !fs.existsSync(replaceSignal)) return;",
+            "  replacing = true;",
+            "  original.close();",
+            "  setTimeout(() => {",
+            '    replacement.listen(port, "127.0.0.1", () => {',
+            '      fs.writeFileSync(replacementReady, "ready");',
+            "    });",
+            "  }, 10);",
+            "}, 10);",
+            'original.listen(port, "127.0.0.1", () => {',
+            '  fs.writeFileSync(readyFile, "ready");',
+            "});",
+            "process.on(\"exit\", () => clearInterval(timer));",
+            "",
+          ].join("\n"),
+          "utf8",
+        );
+        const port = await availablePort();
+        listener = spawn(
+          process.execPath,
+          [
+            listenerScript,
+            String(port),
+            readyFile,
+            connectedFile,
+            replaceSignal,
+            replacementReady,
+            originalRequest,
+            replacementRequest,
+          ],
+          { stdio: "ignore", windowsHide: true },
+        );
+        await waitForFile(readyFile);
+
+        const stopScript = path.resolve(
+          import.meta.dirname,
+          "..",
+          "scripts",
+          "release",
+          "stop-daemon.ps1",
+        );
+        const quote = (value: string) => value.replaceAll("'", "''");
+        const command = [
+          `. '${quote(stopScript)}' -InstallDirectory '${quote(installDirectory)}'`,
+          `$entrypoint = [IO.Path]::GetFullPath((Join-Path '${quote(installDirectory)}' 'app\\dist\\daemon\\main.js'))`,
+          "$ownerA = [pscustomobject]@{ ProcessId = 1001; CreationMarker = '133713371337000001'; ExecutablePath = 'C:\\runtime\\node.exe'; Entrypoint = $entrypoint }",
+          "$script:ownerReads = 0",
+          `function Get-ValidatedGatewayListenerOwner { param([int]$Port, [string[]]$Entrypoints) $script:ownerReads += 1; $deadline = [DateTime]::UtcNow.AddSeconds(5); while (-not (Test-Path -LiteralPath '${quote(connectedFile)}')) { if ([DateTime]::UtcNow -ge $deadline) { throw 'Owner resolution ran before the TCP connection was accepted.' }; Start-Sleep -Milliseconds 10 }; Set-Content -LiteralPath '${quote(replaceSignal)}' -Value 'replace'; while (-not (Test-Path -LiteralPath '${quote(replacementReady)}')) { if ([DateTime]::UtcNow -ge $deadline) { throw 'Replacement listener did not start.' }; Start-Sleep -Milliseconds 10 }; return $ownerA }`,
+          "$challenge = [pscustomobject]@{ ProtocolVersion = 1; InstanceId = '11111111-1111-4111-8111-111111111111'; ChallengeId = '22222222-2222-4222-8222-222222222222'; ClientNonce = ('b' * 64); ResponseProof = ('c' * 64) }",
+          `$accepted = Invoke-AuthenticatedGatewayShutdown -Port ${port} -BearerToken ('a' * 64) -Challenge $challenge -ExpectedOwner $ownerA -Entrypoints @($entrypoint)`,
+          "if (-not $accepted) { throw 'The original connected listener did not accept shutdown.' }",
+          "if ($script:ownerReads -ne 1) { throw 'Listener owner was not resolved exactly once after connect.' }",
+        ].join("; ");
+        const result = spawnSync(
+          "powershell.exe",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+          ],
+          { encoding: "utf8", timeout: 15_000, windowsHide: true },
+        );
+        expect(result.status, `${result.stdout}\n${result.stderr}`).toBe(0);
+        const sentRequest = await readFile(originalRequest, "utf8");
+        expect(sentRequest).toContain("POST /v2/admin/shutdown HTTP/1.1");
+        expect(sentRequest).toContain(`Authorization: Bearer ${"a".repeat(64)}`);
+        await expect(readFile(replacementRequest, "utf8")).rejects.toMatchObject({
+          code: "ENOENT",
+        });
+      } finally {
+        if (listener !== undefined) {
+          await stopTestProcess(listener);
+        }
+        await rm(root, { force: true, recursive: true });
+      }
+    },
+    30_000,
   );
 });

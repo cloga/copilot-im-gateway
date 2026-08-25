@@ -7,7 +7,10 @@ import {
 } from "node:http";
 import { URL } from "node:url";
 import { ZodError, type ZodType } from "zod";
-import { deferInboundMessage } from "../core/contracts.js";
+import {
+  canonicalizeIdentityComponents,
+  deferInboundMessage,
+} from "../core/contracts.js";
 import { GatewayError, gatewayErrorCodes, toErrorEnvelope } from "../core/errors.js";
 import { constantTimeTokenEqual } from "../core/security.js";
 import type { GatewayService } from "./gateway.js";
@@ -25,12 +28,15 @@ import {
   v2LeaseRequestSchema,
   v2LoginPollSchema,
   v2OutboundMessageSchema,
+  v2ShutdownIdentityRequestSchema,
+  v2ShutdownRequestSchema,
   v2WorkspaceAliasSchema,
 } from "./schemas.js";
 
 const maxBodyBytes = 1024 * 1024;
-const shutdownChallengePattern = /^[0-9a-f]{64}$/u;
-const shutdownProofPattern = /^[0-9a-f]{64}$/u;
+const shutdownChallengeTtlMs = 10_000;
+const shutdownChallengeReplayRetentionMs = 5 * 60_000;
+const maxShutdownChallenges = 64;
 export const gatewayApiVersion = 2;
 export const gatewayCapabilities = [
   "account-scoped-routing",
@@ -43,6 +49,10 @@ export interface GatewayHttpHandlerOptions {
   service: GatewayService;
   bearerToken: string;
   onShutdown?: () => Promise<void> | void;
+  shutdownProtocolDependencies?: {
+    now?: () => number;
+    createId?: () => string;
+  };
 }
 
 export interface GatewayHttpServerOptions extends GatewayHttpHandlerOptions {
@@ -59,14 +69,255 @@ export interface ReservedGatewayHttpServer extends RunningGatewayServer {
   activate(options: GatewayHttpHandlerOptions): RunningGatewayServer;
 }
 
+interface ShutdownOwner {
+  pid: number;
+  creationMarker: string;
+  executablePath: string;
+  entrypoint: string;
+}
+
+interface ShutdownIdentityRequest {
+  protocolVersion: 1;
+  owner: ShutdownOwner;
+  port: number;
+  clientNonce: string;
+  requestProof: string;
+}
+
+interface ShutdownRequest {
+  protocolVersion: 1;
+  instanceId: string;
+  challengeId: string;
+  clientNonce: string;
+  responseProof: string;
+}
+
+interface ShutdownChallengeRecord {
+  instanceId: string;
+  challengeId: string;
+  clientNonce: string;
+  responseProof: string;
+  expiresAtMs: number;
+  retainedUntilMs: number;
+  state: "active" | "consumed" | "expired";
+}
+
 function shutdownProof(
   bearerToken: string,
-  purpose: "request" | "response",
-  challenge: string,
+  purpose: "identity-request" | "identity-response",
+  values: readonly string[],
 ): string {
   return createHmac("sha256", bearerToken)
-    .update(`${purpose}\0${challenge}`, "utf8")
+    .update(
+      canonicalizeIdentityComponents([
+        "copilot-im-gateway-shutdown",
+        "1",
+        purpose,
+        ...values,
+      ]),
+      "utf8",
+    )
     .digest("hex");
+}
+
+class ShutdownChallengeRegistry {
+  readonly #bearerToken: string;
+  readonly #processId: number;
+  readonly #port: number;
+  readonly #now: () => number;
+  readonly #createId: () => string;
+  readonly #instanceId: string;
+  readonly #challenges = new Map<string, ShutdownChallengeRecord>();
+
+  constructor(options: {
+    bearerToken: string;
+    processId: number;
+    port: number;
+    now: () => number;
+    createId: () => string;
+  }) {
+    this.#bearerToken = options.bearerToken;
+    this.#processId = options.processId;
+    this.#port = options.port;
+    this.#now = options.now;
+    this.#createId = options.createId;
+    this.#instanceId = this.#createId();
+  }
+
+  issue(input: ShutdownIdentityRequest): {
+    protocolVersion: 1;
+    apiVersion: number;
+    capabilities: typeof gatewayCapabilities;
+    instanceId: string;
+    challengeId: string;
+    owner: ShutdownOwner;
+    port: number;
+    clientNonce: string;
+    expiresAt: number;
+    responseProof: string;
+  } {
+    const requestProof = shutdownProof(
+      this.#bearerToken,
+      "identity-request",
+      [
+        String(input.owner.pid),
+        input.owner.creationMarker,
+        String(input.port),
+        input.clientNonce,
+        input.owner.executablePath,
+        input.owner.entrypoint,
+      ],
+    );
+    if (
+      input.owner.pid !== this.#processId ||
+      input.port !== this.#port ||
+      !constantTimeTokenEqual(input.requestProof, requestProof)
+    ) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.authenticationRequired,
+        message: "Gateway shutdown identity proof is invalid.",
+        status: 401,
+      });
+    }
+
+    const now = this.#readNow();
+    this.#cleanupRetained(now);
+    if (
+      [...this.#challenges.values()].some(
+        (challenge) => challenge.clientNonce === input.clientNonce,
+      )
+    ) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.shutdownChallengeReplayed,
+        message: "Gateway shutdown identity nonce was already used.",
+        status: 409,
+      });
+    }
+    if (this.#challenges.size >= maxShutdownChallenges) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.shutdownChallengeCapacityExceeded,
+        message: "Gateway shutdown challenge capacity is temporarily exhausted.",
+        status: 503,
+        retryable: true,
+      });
+    }
+
+    const challengeId = this.#createId();
+    if (this.#challenges.has(challengeId)) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.internal,
+        message: "Gateway shutdown challenge generation failed.",
+        status: 500,
+      });
+    }
+    const expiresAtMs = now + shutdownChallengeTtlMs;
+    const responseProof = shutdownProof(
+      this.#bearerToken,
+      "identity-response",
+      [
+        String(gatewayApiVersion),
+        this.#instanceId,
+        challengeId,
+        String(input.owner.pid),
+        input.owner.creationMarker,
+        String(input.port),
+        input.clientNonce,
+        String(expiresAtMs),
+        input.owner.executablePath,
+        input.owner.entrypoint,
+      ],
+    );
+    this.#challenges.set(challengeId, {
+      instanceId: this.#instanceId,
+      challengeId,
+      clientNonce: input.clientNonce,
+      responseProof,
+      expiresAtMs,
+      retainedUntilMs:
+        expiresAtMs + shutdownChallengeReplayRetentionMs,
+      state: "active",
+    });
+    return {
+      protocolVersion: 1,
+      apiVersion: gatewayApiVersion,
+      capabilities: gatewayCapabilities,
+      instanceId: this.#instanceId,
+      challengeId,
+      owner: input.owner,
+      port: input.port,
+      clientNonce: input.clientNonce,
+      expiresAt: expiresAtMs,
+      responseProof,
+    };
+  }
+
+  consume(input: ShutdownRequest): void {
+    const now = this.#readNow();
+    this.#cleanupRetained(now);
+    const challenge = this.#challenges.get(input.challengeId);
+    if (challenge === undefined) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.shutdownChallengeInvalid,
+        message: "Gateway shutdown challenge is invalid.",
+        status: 401,
+      });
+    }
+    if (challenge.state === "consumed") {
+      throw new GatewayError({
+        code: gatewayErrorCodes.shutdownChallengeReplayed,
+        message: "Gateway shutdown challenge was already consumed.",
+        status: 409,
+      });
+    }
+    if (challenge.state === "expired" || now >= challenge.expiresAtMs) {
+      challenge.state = "expired";
+      throw new GatewayError({
+        code: gatewayErrorCodes.shutdownChallengeExpired,
+        message: "Gateway shutdown challenge expired.",
+        status: 409,
+      });
+    }
+    if (
+      input.instanceId !== challenge.instanceId ||
+      input.clientNonce !== challenge.clientNonce ||
+      !constantTimeTokenEqual(input.responseProof, challenge.responseProof)
+    ) {
+      throw new GatewayError({
+        code: gatewayErrorCodes.shutdownChallengeInvalid,
+        message: "Gateway shutdown challenge is invalid.",
+        status: 401,
+      });
+    }
+    challenge.state = "consumed";
+  }
+
+  #readNow(): number {
+    const now = this.#now();
+    if (!Number.isSafeInteger(now)) {
+      throw new Error("Shutdown challenge clock returned an invalid timestamp.");
+    }
+    return now;
+  }
+
+  #cleanupRetained(now: number): void {
+    for (const [challengeId, challenge] of this.#challenges) {
+      if (challenge.retainedUntilMs <= now) {
+        this.#challenges.delete(challengeId);
+      } else if (
+        challenge.state === "active" &&
+        challenge.expiresAtMs <= now
+      ) {
+        challenge.state = "expired";
+      }
+    }
+  }
+}
+
+interface ActiveGatewayHttpHandlerOptions {
+  service: GatewayService;
+  bearerToken: string;
+  onShutdown?: () => Promise<void> | void;
+  shutdownChallenges: ShutdownChallengeRegistry;
 }
 
 function isLoopbackOrigin(origin: string): boolean {
@@ -138,29 +389,6 @@ async function readJson<T>(
   return schema.parse(parsed);
 }
 
-async function requireEmptyBody(request: IncomingMessage): Promise<void> {
-  let size = 0;
-  for await (const chunk of request) {
-    size += Buffer.isBuffer(chunk)
-      ? chunk.length
-      : Buffer.byteLength(chunk);
-    if (size > maxBodyBytes) {
-      throw new GatewayError({
-        code: gatewayErrorCodes.invalidInput,
-        message: "Request body exceeds the 1 MiB limit.",
-        status: 413,
-      });
-    }
-  }
-  if (size !== 0) {
-    throw new GatewayError({
-      code: gatewayErrorCodes.invalidInput,
-      message: "This endpoint does not accept a request body.",
-      status: 400,
-    });
-  }
-}
-
 function authenticate(
   request: IncomingMessage,
   expectedToken: string,
@@ -199,7 +427,7 @@ function isUnsafeLegacyV1Operation(method: string, pathname: string): boolean {
 export async function reserveGatewayHttpServer(
   port: number,
 ): Promise<ReservedGatewayHttpServer> {
-  let handlerOptions: GatewayHttpHandlerOptions | undefined;
+  let handlerOptions: ActiveGatewayHttpHandlerOptions | undefined;
   let activated = false;
   let closed = false;
   const server = createServer((request, response) => {
@@ -270,9 +498,18 @@ export async function reserveGatewayHttpServer(
       }
       const onShutdown = options.onShutdown;
       let shutdownScheduled = false;
+      const shutdownProtocolDependencies =
+        options.shutdownProtocolDependencies ?? {};
       handlerOptions = {
         service: options.service,
         bearerToken: options.bearerToken,
+        shutdownChallenges: new ShutdownChallengeRegistry({
+          bearerToken: options.bearerToken,
+          processId: process.pid,
+          port: address.port,
+          now: shutdownProtocolDependencies.now ?? Date.now,
+          createId: shutdownProtocolDependencies.createId ?? randomUUID,
+        }),
         ...(onShutdown === undefined
           ? {}
           : {
@@ -310,7 +547,7 @@ export async function startGatewayHttpServer(
 }
 
 async function handleRequest(
-  options: GatewayHttpHandlerOptions,
+  options: ActiveGatewayHttpHandlerOptions,
   request: IncomingMessage,
   response: ServerResponse,
 ): Promise<void> {
@@ -342,30 +579,9 @@ async function handleRequest(
       return;
     }
 
-    if (method === "GET" && pathname === "/v2/admin/identity") {
-      const challenge = request.headers["x-gateway-shutdown-challenge"];
-      const proof = request.headers["x-gateway-shutdown-proof"];
-      if (
-        typeof challenge !== "string" ||
-        typeof proof !== "string" ||
-        !shutdownChallengePattern.test(challenge) ||
-        !shutdownProofPattern.test(proof) ||
-        !constantTimeTokenEqual(
-          proof,
-          shutdownProof(options.bearerToken, "request", challenge),
-        )
-      ) {
-        throw new GatewayError({
-          code: gatewayErrorCodes.authenticationRequired,
-          message: "Gateway shutdown identity proof is invalid.",
-          status: 401,
-        });
-      }
-      sendJson(response, 200, {
-        apiVersion: gatewayApiVersion,
-        capabilities: gatewayCapabilities,
-        proof: shutdownProof(options.bearerToken, "response", challenge),
-      });
+    if (method === "POST" && pathname === "/v2/admin/identity") {
+      const input = await readJson(request, v2ShutdownIdentityRequestSchema);
+      sendJson(response, 200, options.shutdownChallenges.issue(input));
       return;
     }
 
@@ -379,7 +595,8 @@ async function handleRequest(
           status: 503,
         });
       }
-      await requireEmptyBody(request);
+      const input = await readJson(request, v2ShutdownRequestSchema);
+      options.shutdownChallenges.consume(input);
       sendJson(response, 202, { accepted: true });
       void options.onShutdown();
       return;

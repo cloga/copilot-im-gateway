@@ -11,6 +11,41 @@ const identifier = z
     "Identifier must not contain control or separator characters.",
   );
 
+const shutdownHex = z.string().length(64).regex(/^[a-f0-9]{64}$/u);
+const shutdownProcessPath = z
+  .string()
+  .min(1)
+  .max(32_767)
+  .refine(isWellFormedUnicode, "Process path must be well-formed Unicode.")
+  .refine((value) => !value.includes("\0"), "Process path must not contain NUL.");
+
+export const v2ShutdownIdentityRequestSchema = z
+  .object({
+    protocolVersion: z.literal(1),
+    owner: z
+      .object({
+        pid: z.number().int().positive().max(0xffff_ffff),
+        creationMarker: z.string().regex(/^[0-9]{1,20}$/u),
+        executablePath: shutdownProcessPath,
+        entrypoint: shutdownProcessPath,
+      })
+      .strict(),
+    port: z.number().int().min(1).max(65_535),
+    clientNonce: shutdownHex,
+    requestProof: shutdownHex,
+  })
+  .strict();
+
+export const v2ShutdownRequestSchema = z
+  .object({
+    protocolVersion: z.literal(1),
+    instanceId: z.uuid(),
+    challengeId: z.uuid(),
+    clientNonce: shutdownHex,
+    responseProof: shutdownHex,
+  })
+  .strict();
+
 const tenantId = z.literal("local").default("local");
 const routeIdentity = z.object({
   tenantId,
