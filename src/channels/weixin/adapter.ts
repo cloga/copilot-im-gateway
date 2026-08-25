@@ -213,6 +213,9 @@ export class WeixinAdapter implements LoginCapableChannelAdapter {
           },
           credentials,
           this.#clock.now().toISOString(),
+          status.ilink_user_id === undefined
+            ? {}
+            : { userId: status.ilink_user_id },
         );
         await this.#startPolling();
         return {

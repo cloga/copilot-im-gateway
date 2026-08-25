@@ -6,6 +6,7 @@ import {
   type GatewayPaths,
 } from "./auth.js";
 import { GatewayService } from "./gateway.js";
+import { loadOrCreateMasterKey } from "./master-key.js";
 import {
   reserveGatewayHttpServer,
   type RunningGatewayServer,
@@ -29,6 +30,7 @@ export interface GatewayBootstrapOptions {
   storeOptions?: GatewayStoreOptions;
   onShutdown?: () => Promise<void> | void;
   loadBearerToken?: (tokenPath: string) => string;
+  loadMasterKey?: (keyPath: string, databasePath: string) => Buffer;
   createStore?: (
     databasePath: string,
     options: GatewayStoreOptions,
@@ -44,6 +46,59 @@ export function parseGatewayPort(value: string | undefined): number {
   return port;
 }
 
+function parsePositiveInteger(
+    environment: NodeJS.ProcessEnv,
+    name: string,
+    fallback: number,
+    maximum: number,
+  ): number {
+    const raw = environment[name];
+    if (raw === undefined || raw.length === 0) {
+      return fallback;
+    }
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < 1 || value > maximum) {
+      throw new Error(`${name} must be an integer from 1 to ${maximum}.`);
+    }
+    return value;
+  }
+
+export function lifecycleOptionsFromEnvironment(
+    environment: NodeJS.ProcessEnv,
+  ): Pick<
+    GatewayStoreOptions,
+    | "cleanupBatchSize"
+    | "completedBodyRetentionHours"
+    | "contextTokenRetentionDays"
+    | "failedBodyRetentionHours"
+  > {
+    return {
+      completedBodyRetentionHours: parsePositiveInteger(
+        environment,
+        "COPILOT_IM_GATEWAY_COMPLETED_BODY_HOURS",
+        24,
+        24 * 30,
+      ),
+      failedBodyRetentionHours: parsePositiveInteger(
+        environment,
+        "COPILOT_IM_GATEWAY_FAILED_BODY_HOURS",
+        72,
+        24 * 30,
+      ),
+      contextTokenRetentionDays: parsePositiveInteger(
+        environment,
+        "COPILOT_IM_GATEWAY_CONTEXT_TOKEN_DAYS",
+        7,
+        30,
+      ),
+      cleanupBatchSize: parsePositiveInteger(
+        environment,
+        "COPILOT_IM_GATEWAY_CLEANUP_BATCH_SIZE",
+        500,
+        5_000,
+      ),
+    };
+  }
 function productionChannels(
   store: GatewayStore,
   environment: NodeJS.ProcessEnv,
@@ -67,17 +122,31 @@ export async function bootstrapGateway(
   let store: GatewayStore | undefined;
   let service: GatewayService | undefined;
   try {
+    const environment = options.environment ?? process.env;
+    const masterKey = (
+      options.loadMasterKey ??
+      ((keyPath, databasePath) =>
+        loadOrCreateMasterKey({ keyPath, databasePath }))
+    )(options.paths.keyPath, options.paths.databasePath);
     const bearerToken = (options.loadBearerToken ?? loadOrCreateBearerToken)(
       options.paths.tokenPath,
     );
-    store = (options.createStore ?? ((databasePath, storeOptions) =>
-      new GatewayStore(databasePath, storeOptions)))(
-      options.paths.databasePath,
-      options.storeOptions ?? {},
-    );
+    try {
+      store = (options.createStore ?? ((databasePath, storeOptions) =>
+        new GatewayStore(databasePath, storeOptions)))(
+        options.paths.databasePath,
+        {
+          ...lifecycleOptionsFromEnvironment(environment),
+          ...options.storeOptions,
+          secretKey: masterKey,
+        },
+      );
+    } finally {
+      masterKey.fill(0);
+    }
     service = new GatewayService(store);
     const channels = options.createChannels?.(store) ??
-      productionChannels(store, options.environment ?? process.env);
+      productionChannels(store, environment);
     for (const channel of channels) {
       service.registerChannel(channel);
     }

@@ -594,6 +594,10 @@ describe("release packaging", () => {
       path.join(root, "scripts", "release", "stop-daemon.ps1"),
       "utf8",
     );
+    const credentialKeyScript = await readFile(
+      path.join(root, "scripts", "release", "credential-key.ps1"),
+      "utf8",
+    );
     const installerSmoke = await readFile(
       path.join(root, "scripts", "installer", "smoke-windows-installer.ps1"),
       "utf8",
@@ -606,11 +610,13 @@ describe("release packaging", () => {
     expect(buildScript).toContain("npm-cli.js");
     expect(buildScript).toContain("esm-closure.mjs");
     expect(buildScript).toContain("daemon-runtime-closure.json");
+    expect(buildScript).toContain("credential-key.ps1");
     expect(installer).toContain("PrivilegesRequired=lowest");
     expect(installer).toContain("ArchitecturesAllowed=x64compatible");
     expect(installer).toContain("Copilot-IM-Gateway-Setup-v{#AppVersion}-x64");
     expect(installer).not.toContain("runascurrentuser");
     expect(installer).toContain("PrepareToInstall");
+    expect(installer).toContain("credential-key.ps1");
     expect(installer).toContain("ExtractTemporaryFile('stop-daemon.ps1')");
     expect(installer).toContain(
       "GatewayPort := StrToIntDef(PortText, -1);",
@@ -664,6 +670,7 @@ describe("release packaging", () => {
         installScript,
         installer,
         stopDaemonScript,
+        credentialKeyScript,
       ].join("\n"),
     ).not.toContain("Stop-Process");
     expect(stopDaemonScript).not.toContain("Wait-Process");
@@ -689,6 +696,20 @@ describe("release packaging", () => {
     );
     expect(installerSmoke).toContain(
       "Upgrade did not wait for loopback port release.",
+    );
+    expect(credentialKeyScript).toContain("SetAccessRuleProtection($true, $false)");
+    expect(credentialKeyScript).toContain(
+      "[Security.Principal.WindowsIdentity]::GetCurrent().User",
+    );
+    expect(credentialKeyScript).toContain("$rules.Count -ne 1");
+    expect(credentialKeyScript).toContain("[IO.FileMode]::CreateNew");
+    expect(credentialKeyScript).toContain("$stream.Flush($true)");
+    expect(credentialKeyScript).not.toContain("icacls");
+    expect(installerSmoke).toContain(
+      "Upgrade did not reuse the existing credential master key.",
+    );
+    expect(installerSmoke).toContain(
+      "Uninstaller silently removed the credential master key.",
     );
   });
 

@@ -34,6 +34,7 @@ const releaseInputs = [
   "THIRD_PARTY_NOTICES.md",
   "package.json",
   "scripts/release/install.ps1",
+  "scripts/release/credential-key.ps1",
   "scripts/release/start.ps1",
   "scripts/release/stop-daemon.ps1",
 ];
@@ -102,6 +103,10 @@ async function prepareStage(root, stage) {
   await copyInput(
     path.join(root, "package-lock.json"),
     path.join(stage, "npm-shrinkwrap.json"),
+  );
+  await rename(
+    path.join(stage, "scripts", "release", "credential-key.ps1"),
+    path.join(stage, "credential-key.ps1"),
   );
   await rename(
     path.join(stage, "scripts", "release", "install.ps1"),

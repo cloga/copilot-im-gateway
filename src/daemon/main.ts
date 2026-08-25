@@ -30,8 +30,9 @@ const ownershipHeartbeat = setInterval(() => {
   try {
     store.renewOwnership();
     if (Date.now() >= nextCleanupAt) {
-      store.cleanup(new Date().toISOString());
-      nextCleanupAt = Date.now() + 24 * 60 * 60 * 1_000;
+      const cleanup = store.cleanup(new Date().toISOString());
+      nextCleanupAt =
+        Date.now() + (cleanup.hasMore ? 5_000 : 60 * 60 * 1_000);
     }
   } catch (error) {
     console.error("Gateway database ownership heartbeat failed", error);
@@ -40,7 +41,7 @@ const ownershipHeartbeat = setInterval(() => {
 }, 5_000);
 
 console.error(`Copilot IM Gateway listening at ${running.url}`);
-console.error(`Authentication token file: ${paths.tokenPath}`);
+console.error("Local authentication and credential key files are ready.");
 
 process.once("SIGINT", () => {
   void stop("SIGINT").then(() => {

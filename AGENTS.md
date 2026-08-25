@@ -80,8 +80,10 @@ lines. Coverage includes all production files and must meet or exceed
 Do not weaken CI, coverage, security tests, release/installer verification, or
 the canonical verification closure.
 
-`Required governance / Required policy` is supplied by GitHub's official
-repository Ruleset `workflows` rule. It first validates the event and repository
+`Required governance / Required policy` and CI are the active branch-protection
+gates. The personal-repository API returned HTTP 422 for GitHub's Ruleset
+`workflows` rule, so that stronger trust root is not active. The checked-in
+required workflow first validates the event and repository
 identity, then checks out exactly `github.workflow_sha`, installs that trusted
 commit's dependencies, and treats the pull-request or merge-group trees only as
 git data. Same-repository `cloga/*` branches require both the `cloga` PR author
@@ -96,17 +98,15 @@ the application version fields. Changing that executable control plane or
 dependency graph requires an audited administrator update of the immutable
 Ruleset pin.
 
-The Ruleset must require
+An organization-level required workflow or dedicated external GitHub App/check
+identity is required for strong separation. If that becomes available, it must require
 `.github/workflows/governance-required.yml` from
 `cloga/copilot-im-gateway` (repository ID `1343812506`) at the exact immutable
 `<merge-commit-sha>` produced when this bootstrap is merged on `main`.
-`github.workflow_sha` is the checkout and execution trust pin. The repository
-owner performs this one administrative bootstrap merge because the old
-BASE-only label gate cannot admit its own removal, then immediately removes the
-old `Protected policy` branch-status requirement and activates the `workflows`
-rule at that merge SHA. This is not a reusable bypass. Every SHA or rule update
-is an audited administrator action. Agents must not push, merge, release, or
-alter live rulesets; status contexts are auxiliary only. See
+`github.workflow_sha` is the checkout and execution trust pin. Every future SHA
+or rule update is an audited administrator action. Agents must not push, merge,
+release, or alter live rulesets and must not weaken current status checks or
+governance code. See
 `docs/security.md`.
 
 Also configure a protected `v*` tag ruleset or release environment. The Release

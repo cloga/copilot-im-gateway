@@ -14,10 +14,15 @@ packages, copied secrets, or interactive configuration.
 
 ```powershell
 $env:COPILOT_IM_GATEWAY_DATA_DIR = "$PWD\.copilot-im-gateway"
+if ($IsWindows) {
+  . .\scripts\release\credential-key.ps1
+}
 npm run dev
 ```
 
-The daemon reports its loopback URL and token file path, never the token value.
+The daemon reports its loopback URL, never token values, credential values, or
+credential-key paths. On Windows the ACL helper must run in the same PowerShell
+process so the daemon receives its verified operator-only ACL attestation.
 The installed daemon and extension are a compatibility unit: `/v2/status`
 advertises the required API capabilities, and the extension refuses unsafe work
 with `DAEMON_UPGRADE_REQUIRED` when they are missing. Release validation includes
@@ -55,15 +60,12 @@ worktree whose app-generated branch name cannot use the required `cloga/`
 prefix, set `AGENT_POLICY_HEAD_REF=cloga/<remote-name>` while running verify.
 CI always validates the actual PR head ref.
 
-This governance transition is a one-time trust bootstrap. The old BASE-only
-label gate cannot approve removal of its own obsolete blocking condition. After
-configured CI and review complete, the repository owner performs one
-administrative merge of this transition PR, immediately removes the old
-`Protected policy` branch-status requirement, and creates the active repository
-Ruleset `workflows` rule described in [security.md](security.md). In that
-Ruleset request, replace `<merge-commit-sha>` with the exact resulting merge
-commit on `main`; do not substitute the pre-merge HEAD. This is not a reusable
-bypass.
+The personal repository API currently returns HTTP 422 for a repository
+Ruleset `workflows` rule. Branch protection therefore requires `Required
+policy` and CI today. Strong workflow identity separation requires an
+organization-level required workflow or a dedicated external GitHub App/check
+identity; see [security.md](security.md). Do not weaken the checked-in
+governance verifier while that limitation remains.
 
 The rule requires `.github/workflows/governance-required.yml` from
 `cloga/copilot-im-gateway` (repository ID `1343812506`). The workflow has only
@@ -92,7 +94,8 @@ same-repository `cloga/*` or Dependabot branch, author, and actor identities.
 `merge_group/checks_requested` evaluates the synthetic queue head against
 `refs/heads/main` with the same semantic checks.
 
-Protected paths remain visible without an approval label. Every Ruleset or
-source-SHA update is an audited administrator action. Branch-protection status
-contexts may supplement the required workflow but are not its trust root.
+Protected paths remain visible without an approval label. Every future Ruleset
+or source-SHA update is an audited administrator action. Current
+branch-protection status contexts are required controls, but are not a
+separately hosted trust root.
 Agents must not modify live rulesets or add API automation that does so.

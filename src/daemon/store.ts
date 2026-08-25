@@ -29,8 +29,17 @@ import {
   hashSecret,
   systemClock,
 } from "../core/security.js";
+import {
+  AesGcmSecretCipher,
+  channelSecretEnvelopeVersion,
+  type SecretCipher,
+  type SecretStateIdentity,
+} from "../core/secret-state.js";
 
-const schemaVersion = 3;
+const schemaVersion = 4;
+const millisecondsPerHour = 60 * 60 * 1_000;
+const millisecondsPerDay = 24 * millisecondsPerHour;
+const testSecretKey = Buffer.alloc(32, 0x5a);
 
 interface CountRow {
   count: number;
@@ -78,6 +87,12 @@ export interface GatewayStoreOptions {
   auditRetentionDays?: number;
   maxRejectionBuckets?: number;
   rejectionRetentionDays?: number;
+  completedBodyRetentionHours?: number;
+  failedBodyRetentionHours?: number;
+  contextTokenRetentionDays?: number;
+  cleanupBatchSize?: number;
+  secretKey?: Uint8Array;
+  secretCipher?: SecretCipher;
 }
 
 interface RequiredStoreOptions {
@@ -94,6 +109,10 @@ interface RequiredStoreOptions {
   auditRetentionDays: number;
   maxRejectionBuckets: number;
   rejectionRetentionDays: number;
+  completedBodyRetentionHours: number;
+  failedBodyRetentionHours: number;
+  contextTokenRetentionDays: number;
+  cleanupBatchSize: number;
 }
 
 export type AdmissionDisposition =
@@ -172,6 +191,7 @@ export class GatewayStore {
   readonly #ownerToken: string;
   readonly #ownerId: string;
   readonly #options: RequiredStoreOptions;
+  #secretCipher: SecretCipher;
   #closed = false;
   #transactionDepth = 0;
   #savepointSequence = 0;
@@ -182,6 +202,17 @@ export class GatewayStore {
     this.#clock = options.clock ?? systemClock;
     this.#ownerToken = randomUUID();
     this.#ownerId = options.ownerId ?? `gateway-${process.pid}`;
+    if (options.secretCipher !== undefined && options.secretKey !== undefined) {
+      throw new Error("Configure either secretCipher or secretKey, not both.");
+    }
+    const secretKey =
+      options.secretKey ??
+      (process.env.NODE_ENV === "test" ? testSecretKey : undefined);
+    if (options.secretCipher === undefined && secretKey === undefined) {
+      throw new Error("A protected credential master key is required.");
+    }
+    this.#secretCipher =
+      options.secretCipher ?? new AesGcmSecretCipher(secretKey as Uint8Array);
     this.#options = {
       ownershipLeaseMs: options.ownershipLeaseMs ?? 15_000,
       reservationLeaseMs: options.reservationLeaseMs ?? 30_000,
@@ -202,14 +233,32 @@ export class GatewayStore {
         30,
         Math.max(1, options.rejectionRetentionDays ?? 7),
       ),
+      completedBodyRetentionHours: Math.min(
+        24 * 30,
+        Math.max(1, options.completedBodyRetentionHours ?? 24),
+      ),
+      failedBodyRetentionHours: Math.min(
+        24 * 30,
+        Math.max(1, options.failedBodyRetentionHours ?? 72),
+      ),
+      contextTokenRetentionDays: Math.min(
+        30,
+        Math.max(1, options.contextTokenRetentionDays ?? 7),
+      ),
+      cleanupBatchSize: Math.min(
+        5_000,
+        Math.max(1, Math.floor(options.cleanupBatchSize ?? 500)),
+      ),
     };
     try {
       this.#database.exec(
-        "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 2500;",
+        "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON; PRAGMA busy_timeout = 2500;",
       );
       this.#initializeOwnedSchema();
+      this.#database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
     } catch (error) {
       this.#database.close();
+      this.#secretCipher.destroy();
       throw error;
     }
   }
@@ -226,6 +275,7 @@ export class GatewayStore {
         .run(this.#ownerToken);
     }, false);
     this.#database.close();
+    this.#secretCipher.destroy();
     this.#closed = true;
   }
 
@@ -403,6 +453,7 @@ export class GatewayStore {
       if (version === schemaVersion) {
         this.#discardUncorrelatedRateEvents();
         this.#repairAuditIndex();
+        this.#validateSecretState();
         return;
       }
 
@@ -442,6 +493,7 @@ export class GatewayStore {
         );
         this.#quarantineLegacyTables();
       }
+      this.#migrateChannelSecrets();
       this.#repairAuditIndex();
       this.#database.exec(`PRAGMA user_version = ${schemaVersion}`);
   }
@@ -484,6 +536,30 @@ export class GatewayStore {
     ) {
       this.#database.exec(
         "ALTER TABLE rate_events ADD COLUMN message_id_hash TEXT",
+      );
+    }
+    if (
+      this.#tableExists("channel_state") &&
+      !this.#columnExists("channel_state", "secret_version")
+    ) {
+      this.#database.exec(
+        "ALTER TABLE channel_state ADD COLUMN secret_version INTEGER",
+      );
+    }
+    if (
+      this.#tableExists("channel_state") &&
+      !this.#columnExists("channel_state", "expires_at")
+    ) {
+      this.#database.exec(
+        "ALTER TABLE channel_state ADD COLUMN expires_at TEXT",
+      );
+    }
+    if (
+      this.#tableExists("active_channel_accounts") &&
+      !this.#columnExists("active_channel_accounts", "user_id")
+    ) {
+      this.#database.exec(
+        "ALTER TABLE active_channel_accounts ADD COLUMN user_id TEXT",
       );
     }
   }
@@ -662,6 +738,8 @@ export class GatewayStore {
         account_id TEXT NOT NULL,
         state_key TEXT NOT NULL,
         value_json TEXT NOT NULL,
+        secret_version INTEGER,
+        expires_at TEXT,
         updated_at TEXT NOT NULL,
         PRIMARY KEY (tenant_id, channel_id, account_id, state_key)
       );
@@ -669,6 +747,7 @@ export class GatewayStore {
         tenant_id TEXT NOT NULL,
         channel_id TEXT NOT NULL,
         account_id TEXT NOT NULL,
+        user_id TEXT,
         updated_at TEXT NOT NULL,
         PRIMARY KEY (tenant_id, channel_id)
       );
@@ -686,7 +765,145 @@ export class GatewayStore {
         expires_at TEXT NOT NULL,
         renewed_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS gateway_metadata (
+        metadata_key TEXT PRIMARY KEY,
+        metadata_value TEXT NOT NULL
+      );
     `);
+  }
+
+  #migrateChannelSecrets(): void {
+    const rows = this.#database
+      .prepare(
+        `SELECT tenant_id, channel_id, account_id, state_key, value_json,
+                secret_version, updated_at
+         FROM channel_state`,
+      )
+      .all() as Array<{
+      tenant_id: string;
+      channel_id: string;
+      account_id: string;
+      state_key: string;
+      value_json: string;
+      secret_version: number | null;
+      updated_at: string;
+    }>;
+    for (const row of rows) {
+      const identity = this.#secretIdentity(row);
+      if (row.secret_version === channelSecretEnvelopeVersion) {
+        this.#secretCipher.decrypt(identity, row.value_json);
+        continue;
+      }
+      if (row.secret_version !== null) {
+        throw new Error("Sensitive channel state uses an unsupported version.");
+      }
+      const value = JSON.parse(row.value_json) as unknown;
+      const envelope = this.#secretCipher.encrypt(identity, value);
+      const expiresAt = row.state_key.startsWith("context:")
+        ? new Date(
+            new Date(row.updated_at).getTime() +
+              this.#options.contextTokenRetentionDays * millisecondsPerDay,
+          ).toISOString()
+        : null;
+      this.#database
+        .prepare(
+          `UPDATE channel_state
+           SET value_json = ?, secret_version = ?, expires_at = ?
+           WHERE tenant_id = ? AND channel_id = ? AND account_id = ?
+             AND state_key = ?`,
+        )
+        .run(
+          envelope,
+          channelSecretEnvelopeVersion,
+          expiresAt,
+          row.tenant_id,
+          row.channel_id,
+          row.account_id,
+          row.state_key,
+        );
+      if (row.state_key === "credentials") {
+        const publicMetadata = this.#publicCredentialMetadata(value);
+        this.#database
+          .prepare(
+            `UPDATE active_channel_accounts SET user_id = ?
+             WHERE tenant_id = ? AND channel_id = ? AND account_id = ?`,
+          )
+          .run(
+            publicMetadata.userId ?? null,
+            row.tenant_id,
+            row.channel_id,
+            row.account_id,
+          );
+      }
+    }
+    this.#database
+      .prepare(
+        `INSERT INTO gateway_metadata (metadata_key, metadata_value)
+         VALUES ('credential_key_id', ?)
+         ON CONFLICT(metadata_key) DO UPDATE SET
+           metadata_value = excluded.metadata_value`,
+      )
+      .run(this.#secretCipher.keyId);
+  }
+
+  #validateSecretState(): void {
+    const keyId = this.#database
+      .prepare(
+        `SELECT metadata_value FROM gateway_metadata
+         WHERE metadata_key = 'credential_key_id'`,
+      )
+      .get() as { metadata_value: string } | undefined;
+    if (keyId?.metadata_value !== this.#secretCipher.keyId) {
+      throw new Error(
+        "Credential master key does not match the gateway database.",
+      );
+    }
+    const rows = this.#database
+      .prepare(
+        `SELECT tenant_id, channel_id, account_id, state_key, value_json,
+                secret_version
+         FROM channel_state`,
+      )
+      .all() as Array<{
+      tenant_id: string;
+      channel_id: string;
+      account_id: string;
+      state_key: string;
+      value_json: string;
+      secret_version: number | null;
+    }>;
+    for (const row of rows) {
+      if (row.secret_version !== channelSecretEnvelopeVersion) {
+        throw new Error("Plaintext channel state is not permitted.");
+      }
+      this.#secretCipher.decrypt(this.#secretIdentity(row), row.value_json);
+    }
+  }
+
+  #secretIdentity(input: {
+    tenant_id: string;
+    channel_id: string;
+    account_id: string;
+    state_key: string;
+  }): SecretStateIdentity {
+    return {
+      tenantId: input.tenant_id,
+      channelId: input.channel_id,
+      accountId: input.account_id,
+      stateKey: input.state_key,
+    };
+  }
+
+  #publicCredentialMetadata(value: unknown): { userId?: string } {
+    if (
+      typeof value === "object" &&
+      value !== null &&
+      "userId" in value &&
+      typeof value.userId === "string"
+    ) {
+      return { userId: value.userId };
+    }
+    return {};
   }
 
   #quarantineLegacyTables(): void {
@@ -719,9 +936,14 @@ export class GatewayStore {
         .run(
           candidate.entity,
           count,
-          "Missing tenant/account identity; retained in legacy_v1 table and excluded from runtime.",
+          candidate.entity === "channel_state"
+            ? "Missing tenant/account identity; secret state was securely discarded and requires re-login."
+            : "Missing tenant/account identity; retained in legacy_v1 table and excluded from runtime.",
           now,
         );
+      if (candidate.entity === "channel_state") {
+        this.#database.exec(`DROP TABLE ${candidate.table}`);
+      }
     }
     this.#insertAudit({
       createdAt: now,
@@ -1753,18 +1975,21 @@ export class GatewayStore {
     });
   }
 
-  #expireReservationBarriers(now: string): void {
+  #expireReservationBarriers(now: string): number {
     const rows = this.#database
       .prepare(
         `SELECT route_key, message_id_hash, route_sequence
          FROM inbound_admissions
-         WHERE disposition = 'reserved' AND reservation_expires_at <= ?`,
+         WHERE disposition = 'reserved' AND reservation_expires_at <= ?
+         ORDER BY reservation_expires_at, route_key, message_id_hash
+         LIMIT ?`,
       )
-      .all(now) as Array<{
+      .all(now, this.#options.cleanupBatchSize) as Array<{
       route_key: string;
       message_id_hash: string;
       route_sequence: number | null;
     }>;
+    let changes = 0;
     for (const row of rows) {
       const expired = this.#database
         .prepare(
@@ -1777,6 +2002,7 @@ export class GatewayStore {
         )
         .run(now, row.route_key, row.message_id_hash, now);
       if (expired.changes === 1) {
+        changes += 1;
         this.#insertAudit({
           createdAt: now,
           eventType: "inbound.reservation_expired",
@@ -1790,6 +2016,7 @@ export class GatewayStore {
         });
       }
     }
+    return changes;
   }
 
   #recoverExpiredLeases(now: string): void {
@@ -2248,13 +2475,31 @@ export class GatewayStore {
     now: string,
   ): void {
     this.transaction(() => {
+      const envelope = this.#secretCipher.encrypt(
+        {
+          tenantId: identity.tenantId,
+          channelId: identity.channelId,
+          accountId: identity.accountId,
+          stateKey: key,
+        },
+        value,
+      );
+      const expiresAt = key.startsWith("context:")
+        ? new Date(
+            new Date(now).getTime() +
+              this.#options.contextTokenRetentionDays * millisecondsPerDay,
+          ).toISOString()
+        : null;
       this.#database
         .prepare(
           `INSERT INTO channel_state
-             (tenant_id, channel_id, account_id, state_key, value_json, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?)
+             (tenant_id, channel_id, account_id, state_key, value_json,
+              secret_version, expires_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(tenant_id, channel_id, account_id, state_key)
            DO UPDATE SET value_json = excluded.value_json,
+                         secret_version = excluded.secret_version,
+                         expires_at = excluded.expires_at,
                          updated_at = excluded.updated_at`,
         )
         .run(
@@ -2262,7 +2507,9 @@ export class GatewayStore {
           identity.channelId,
           identity.accountId,
           key,
-          JSON.stringify(value),
+          envelope,
+          channelSecretEnvelopeVersion,
+          expiresAt,
           now,
         );
     });
@@ -2274,7 +2521,7 @@ export class GatewayStore {
   ): T | undefined {
     const row = this.#database
       .prepare(
-        `SELECT value_json FROM channel_state
+        `SELECT value_json, secret_version, expires_at FROM channel_state
          WHERE tenant_id = ? AND channel_id = ? AND account_id = ?
            AND state_key = ?`,
       )
@@ -2283,42 +2530,63 @@ export class GatewayStore {
         identity.channelId,
         identity.accountId,
         key,
-      ) as { value_json: string } | undefined;
-    return row === undefined ? undefined : (JSON.parse(row.value_json) as T);
+      ) as
+      | {
+          value_json: string;
+          secret_version: number | null;
+          expires_at: string | null;
+        }
+      | undefined;
+    if (
+      row === undefined ||
+      (row.expires_at !== null &&
+        row.expires_at <= this.#clock.now().toISOString())
+    ) {
+      return undefined;
+    }
+    if (row.secret_version !== channelSecretEnvelopeVersion) {
+      throw new Error("Plaintext channel state is not permitted.");
+    }
+    return this.#secretCipher.decrypt(
+      {
+        tenantId: identity.tenantId,
+        channelId: identity.channelId,
+        accountId: identity.accountId,
+        stateKey: key,
+      },
+      row.value_json,
+    ) as T;
   }
 
   setActiveChannelAccount(
     identity: ChannelAccountIdentity,
     credentials: unknown,
     now: string,
+    publicMetadata: { userId?: string } = {},
   ): void {
     this.transaction(() => {
+      const metadata =
+        publicMetadata.userId === undefined
+          ? this.#publicCredentialMetadata(credentials)
+          : publicMetadata;
       this.#database
         .prepare(
           `INSERT INTO active_channel_accounts
-             (tenant_id, channel_id, account_id, updated_at)
-           VALUES (?, ?, ?, ?)
+             (tenant_id, channel_id, account_id, user_id, updated_at)
+           VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(tenant_id, channel_id)
            DO UPDATE SET account_id = excluded.account_id,
-                         updated_at = excluded.updated_at`,
-        )
-        .run(identity.tenantId, identity.channelId, identity.accountId, now);
-      this.#database
-        .prepare(
-          `INSERT INTO channel_state
-             (tenant_id, channel_id, account_id, state_key, value_json, updated_at)
-           VALUES (?, ?, ?, 'credentials', ?, ?)
-           ON CONFLICT(tenant_id, channel_id, account_id, state_key)
-           DO UPDATE SET value_json = excluded.value_json,
+                         user_id = excluded.user_id,
                          updated_at = excluded.updated_at`,
         )
         .run(
           identity.tenantId,
           identity.channelId,
           identity.accountId,
-          JSON.stringify(credentials),
+          metadata.userId ?? null,
           now,
         );
+      this.setChannelState(identity, "credentials", credentials, now);
     });
   }
 
@@ -2328,7 +2596,7 @@ export class GatewayStore {
   ): { identity: ChannelAccountIdentity; credentials: T } | undefined {
     const row = this.#database
       .prepare(
-        `SELECT a.account_id, s.value_json
+        `SELECT a.account_id, s.value_json, s.secret_version, s.expires_at
          FROM active_channel_accounts a
          JOIN channel_state s
            ON s.tenant_id = a.tenant_id
@@ -2338,13 +2606,21 @@ export class GatewayStore {
          WHERE a.tenant_id = ? AND a.channel_id = ?`,
       )
       .get(tenantId, channelId) as
-      | { account_id: string; value_json: string }
+      | {
+          account_id: string;
+          value_json: string;
+          secret_version: number | null;
+          expires_at: string | null;
+        }
       | undefined;
     return row === undefined
       ? undefined
       : {
           identity: { tenantId, channelId, accountId: row.account_id },
-          credentials: JSON.parse(row.value_json) as T,
+          credentials: this.getChannelState<T>(
+            { tenantId, channelId, accountId: row.account_id },
+            "credentials",
+          ) as T,
         };
   }
 
@@ -2356,17 +2632,8 @@ export class GatewayStore {
   }> {
     const rows = this.#database
       .prepare(
-        `SELECT a.tenant_id, a.channel_id, a.account_id,
-                CASE WHEN json_type(s.value_json, '$.userId') = 'text'
-                  THEN json_extract(s.value_json, '$.userId')
-                  ELSE NULL
-                END AS user_id
+        `SELECT a.tenant_id, a.channel_id, a.account_id, a.user_id
          FROM active_channel_accounts a
-         JOIN channel_state s
-           ON s.tenant_id = a.tenant_id
-          AND s.channel_id = a.channel_id
-          AND s.account_id = a.account_id
-          AND s.state_key = 'credentials'
          ORDER BY a.tenant_id, a.channel_id`,
       )
       .all() as Array<{
@@ -2383,9 +2650,74 @@ export class GatewayStore {
     }));
   }
 
-  cleanup(now: string): { inbox: number; audit: number; rejections: number } {
-    return this.transaction(() => {
-      this.#expireReservationBarriers(now);
+  rotateSecrets(nextCipher: SecretCipher): number {
+    if (nextCipher.keyId === this.#secretCipher.keyId) {
+      throw new Error("Credential rotation requires a different master key.");
+    }
+    const currentCipher = this.#secretCipher;
+    const rotated = this.transaction(() => {
+      const rows = this.#database
+        .prepare(
+          `SELECT tenant_id, channel_id, account_id, state_key, value_json,
+                  secret_version
+           FROM channel_state`,
+        )
+        .all() as Array<{
+        tenant_id: string;
+        channel_id: string;
+        account_id: string;
+        state_key: string;
+        value_json: string;
+        secret_version: number | null;
+      }>;
+      for (const row of rows) {
+        if (row.secret_version !== channelSecretEnvelopeVersion) {
+          throw new Error("Plaintext channel state is not permitted.");
+        }
+        const identity = this.#secretIdentity(row);
+        const value = currentCipher.decrypt(identity, row.value_json);
+        this.#database
+          .prepare(
+            `UPDATE channel_state SET value_json = ?
+             WHERE tenant_id = ? AND channel_id = ? AND account_id = ?
+               AND state_key = ?`,
+          )
+          .run(
+            nextCipher.encrypt(identity, value),
+            row.tenant_id,
+            row.channel_id,
+            row.account_id,
+            row.state_key,
+          );
+      }
+      this.#database
+        .prepare(
+          `UPDATE gateway_metadata SET metadata_value = ?
+           WHERE metadata_key = 'credential_key_id'`,
+        )
+        .run(nextCipher.keyId);
+      return rows.length;
+    });
+    this.#checkpointSensitiveWrites();
+    this.#secretCipher = nextCipher;
+    currentCipher.destroy();
+    return rotated;
+  }
+
+  credentialKeyId(): string {
+    return this.#secretCipher.keyId;
+  }
+
+  cleanup(now: string): {
+    inbox: number;
+    audit: number;
+    rejections: number;
+    bodies: number;
+    channelState: number;
+    hasMore: boolean;
+  } {
+    const result = this.transaction(() => {
+      const reservationBarriers = this.#expireReservationBarriers(now);
       const inboxCutoff = new Date(
         new Date(now).getTime() -
           this.#options.inboxRetentionDays * 24 * 60 * 60 * 1000,
@@ -2394,34 +2726,128 @@ export class GatewayStore {
         new Date(now).getTime() -
           this.#options.auditRetentionDays * 24 * 60 * 60 * 1000,
       ).toISOString();
+      const completedBodyCutoff = new Date(
+        new Date(now).getTime() -
+          this.#options.completedBodyRetentionHours * millisecondsPerHour,
+      ).toISOString();
+      const failedBodyCutoff = new Date(
+        new Date(now).getTime() -
+          this.#options.failedBodyRetentionHours * millisecondsPerHour,
+      ).toISOString();
+      const bodies = this.#database
+        .prepare(
+          `UPDATE inbound_messages
+           SET text = '', attachments_json = '[]', reply_to_message_id = NULL
+           WHERE id IN (
+             SELECT id FROM inbound_messages
+             WHERE ((status = 'completed' AND terminal_at < ?)
+                 OR (status = 'failed' AND terminal_at < ?))
+               AND (text <> '' OR attachments_json <> '[]'
+                    OR reply_to_message_id IS NOT NULL)
+             ORDER BY terminal_at, id
+             LIMIT ?
+           )`,
+        )
+        .run(
+          completedBodyCutoff,
+          failedBodyCutoff,
+          this.#options.cleanupBatchSize,
+        ).changes;
+      const channelState = this.#database
+        .prepare(
+          `DELETE FROM channel_state
+           WHERE rowid IN (
+             SELECT rowid FROM channel_state
+             WHERE expires_at IS NOT NULL AND expires_at <= ?
+             ORDER BY expires_at, rowid
+             LIMIT ?
+           )`,
+        )
+        .run(now, this.#options.cleanupBatchSize).changes;
       const inbox = this.#database
         .prepare(
           `DELETE FROM inbound_messages
-           WHERE status IN (${terminalStatuses.map(() => "?").join(",")})
-             AND terminal_at < ?`,
+           WHERE id IN (
+             SELECT id FROM inbound_messages
+             WHERE status IN (${terminalStatuses.map(() => "?").join(",")})
+               AND terminal_at < ?
+             ORDER BY terminal_at, id
+             LIMIT ?
+           )`,
         )
-        .run(...terminalStatuses, inboxCutoff).changes;
+        .run(
+          ...terminalStatuses,
+          inboxCutoff,
+          this.#options.cleanupBatchSize,
+        ).changes;
       const audit = this.#database
-        .prepare("DELETE FROM audit_events WHERE created_at < ?")
-        .run(auditCutoff).changes;
+        .prepare(
+          `DELETE FROM audit_events WHERE id IN (
+             SELECT id FROM audit_events WHERE created_at < ?
+             ORDER BY created_at, id LIMIT ?
+           )`,
+        )
+        .run(auditCutoff, this.#options.cleanupBatchSize).changes;
       const rejectionCutoff = new Date(
         new Date(now).getTime() -
           this.#options.rejectionRetentionDays * 24 * 60 * 60 * 1000,
       ).toISOString();
       const rejections = this.#database
-        .prepare("DELETE FROM admission_rejections WHERE last_at < ?")
-        .run(rejectionCutoff).changes;
-      this.#database
+        .prepare(
+          `DELETE FROM admission_rejections WHERE slot IN (
+             SELECT slot FROM admission_rejections WHERE last_at < ?
+             ORDER BY last_at, slot LIMIT ?
+           )`,
+        )
+        .run(rejectionCutoff, this.#options.cleanupBatchSize).changes;
+      const admissions = this.#database
         .prepare(
           `DELETE FROM inbound_admissions
-           WHERE updated_at < ? AND disposition <> 'reserved'`,
+           WHERE rowid IN (
+             SELECT rowid FROM inbound_admissions
+             WHERE updated_at < ? AND disposition <> 'reserved'
+             ORDER BY updated_at, rowid LIMIT ?
+           )`,
         )
-        .run(inboxCutoff);
+        .run(inboxCutoff, this.#options.cleanupBatchSize).changes;
+      const counts = [
+        reservationBarriers,
+        bodies,
+        channelState,
+        inbox,
+        audit,
+        rejections,
+        admissions,
+      ].map(Number);
       return {
         inbox: Number(inbox),
         audit: Number(audit),
         rejections: Number(rejections),
+        bodies: Number(bodies),
+        channelState: Number(channelState),
+        hasMore: counts.some(
+          (count) => count >= this.#options.cleanupBatchSize,
+        ),
       };
     });
+    if (
+      result.inbox > 0 ||
+      result.audit > 0 ||
+      result.rejections > 0 ||
+      result.bodies > 0 ||
+      result.channelState > 0
+    ) {
+      this.#checkpointSensitiveWrites();
+    }
+    return result;
+  }
+
+  #checkpointSensitiveWrites(): void {
+    const checkpoint = this.#database
+      .prepare("PRAGMA wal_checkpoint(TRUNCATE)")
+      .get() as { busy: number; log: number; checkpointed: number };
+    if (checkpoint.busy !== 0 || checkpoint.log !== checkpoint.checkpointed) {
+      throw new Error("Sensitive data checkpoint could not complete.");
+    }
   }
 }
